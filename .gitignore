@@ -39,3 +39,40 @@
 
 # debug information files
 *.dwo
+
+# Visual Studio user and cache files
+.vs/
+ipch/
+*.user
+*.suo
+*.db
+*.VC.db
+*.opendb
+*.opensdf
+*.sdf
+*.cache
+*.psess
+*.vsp
+*.vspscc
+
+# MSVC build outputs
+*.idb
+*.ipdb
+*.iobj
+*.exp
+*.res
+*.err
+*.wrn
+*.tlog
+*.lastbuildstate
+*.cso
+
+# Common build directories
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+bin/
+obj/
+out/
+build*/
