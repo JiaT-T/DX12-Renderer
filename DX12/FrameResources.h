@@ -21,6 +21,8 @@ struct ObjectConstants
 struct PassConstants
 {
 	XMFLOAT4X4 ViewProj = MathHelper::Identity4x4();
+	XMFLOAT4X4 LightViewProj = MathHelper::Identity4x4();
+	XMFLOAT4X4 ShadowTransform = MathHelper::Identity4x4();
 
 	XMFLOAT3 cameraPosW = { 0.0f, 0.0f, 0.0f };
 	float totalTime = 0.0f;

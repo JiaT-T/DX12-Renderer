@@ -46,6 +46,8 @@ cbuffer cbMaterial : register(b1)
 cbuffer cbPass : register(b2)
 {
     float4x4 gViewProj;
+    float4x4 gLightViewProj;
+    float4x4 gShadowTransform;
     float3 gCameraPosW;
     float gTotalTime;
     float4 gAmbientLight;
