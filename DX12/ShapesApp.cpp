@@ -107,12 +107,18 @@ bool ShapesApp::InitRnederItems(HINSTANCE hInstance, int nShowCmd, std::wstring 
 	BuildRenderItems();
 	BuildFrameResource();
 	BuildShadowMapResources();
+	BuildBrdfLutResources();
+	BuildPrefilteredEnvironmentMapResources();
+	BuildIrradianceMapResources();
 
 	mCurrentFrameResourcesIndex = 0;
 	mCurrentFrameResources = mFrameResourcesArray[mCurrentFrameResourcesIndex].get();
 
 	BuildShaderResourceView();
 	BuildPSO();
+	RenderBrdfLut();
+	RenderPrefilteredEnvironmentMap();
+	RenderIrradianceMap();
 
 	ThrowIfFailed(mCommandList->Close());
 	ID3D12CommandList* cmdLists[] = { mCommandList.Get() };
@@ -260,6 +266,9 @@ void ShapesApp::DrawRenderItems(const std::vector<RenderItem*>& ritems)
 		objCBAddress += static_cast<UINT64>(ritem->mObjCBIndex) * objConstSize;
 		mCommandList->SetGraphicsRootConstantBufferView(0, objCBAddress);
 		mCommandList->SetGraphicsRootDescriptorTable(7, makeSrvHandle(textures[mEnvironmentTextureName]->srvHeapIndex));
+		mCommandList->SetGraphicsRootDescriptorTable(9, makeSrvHandle(mBrdfLutSrvHeapIndex));
+		mCommandList->SetGraphicsRootDescriptorTable(10, makeSrvHandle(mPrefilteredEnvMapSrvHeapIndex));
+		mCommandList->SetGraphicsRootDescriptorTable(11, makeSrvHandle(mIrradianceMapSrvHeapIndex));
 
 		if (ritem->mat != nullptr)
 		{
@@ -291,7 +300,7 @@ void ShapesApp::OnResize()
 
 void ShapesApp::BuildRootSignature()
 {
-	CD3DX12_ROOT_PARAMETER rootParameters[9];
+	CD3DX12_ROOT_PARAMETER rootParameters[13];
 	rootParameters[0].InitAsConstantBufferView(0);
 	rootParameters[1].InitAsConstantBufferView(1);
 	rootParameters[2].InitAsConstantBufferView(2);
@@ -302,6 +311,9 @@ void ShapesApp::BuildRootSignature()
 	CD3DX12_DESCRIPTOR_RANGE metallicSrvTable;
 	CD3DX12_DESCRIPTOR_RANGE envSrvTable;
 	CD3DX12_DESCRIPTOR_RANGE shadowMapSrvTable;
+	CD3DX12_DESCRIPTOR_RANGE brdfLutSrvTable;
+	CD3DX12_DESCRIPTOR_RANGE prefilteredEnvSrvTable;
+	CD3DX12_DESCRIPTOR_RANGE irradianceMapSrvTable;
 
 	baseColorSrvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
 	normalSrvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1);
@@ -309,6 +321,9 @@ void ShapesApp::BuildRootSignature()
 	metallicSrvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 3);
 	envSrvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 4);
 	shadowMapSrvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 5);
+	brdfLutSrvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 6);
+	prefilteredEnvSrvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 7);
+	irradianceMapSrvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 8);
 
 	rootParameters[3].InitAsDescriptorTable(1, &baseColorSrvTable, D3D12_SHADER_VISIBILITY_PIXEL);
 	rootParameters[4].InitAsDescriptorTable(1, &normalSrvTable, D3D12_SHADER_VISIBILITY_PIXEL);
@@ -316,6 +331,10 @@ void ShapesApp::BuildRootSignature()
 	rootParameters[6].InitAsDescriptorTable(1, &metallicSrvTable, D3D12_SHADER_VISIBILITY_PIXEL);
 	rootParameters[7].InitAsDescriptorTable(1, &envSrvTable, D3D12_SHADER_VISIBILITY_PIXEL);
 	rootParameters[8].InitAsDescriptorTable(1, &shadowMapSrvTable, D3D12_SHADER_VISIBILITY_PIXEL);
+	rootParameters[9].InitAsDescriptorTable(1, &brdfLutSrvTable, D3D12_SHADER_VISIBILITY_PIXEL);
+	rootParameters[10].InitAsDescriptorTable(1, &prefilteredEnvSrvTable, D3D12_SHADER_VISIBILITY_PIXEL);
+	rootParameters[11].InitAsDescriptorTable(1, &irradianceMapSrvTable, D3D12_SHADER_VISIBILITY_PIXEL);
+	rootParameters[12].InitAsConstants(2, 3, 0, D3D12_SHADER_VISIBILITY_PIXEL);
 
 	auto staticSamplers = GetStaticSamplers();
 	CD3DX12_ROOT_SIGNATURE_DESC rootSignatureDesc(
@@ -352,6 +371,12 @@ void ShapesApp::BuildByteCodeAndInputLayout()
 	shaders["shadowMapVS"] = CompileShader(L"Shaders\\ShadowMap.hlsl", nullptr, "VS", "vs_5_0");
 	shaders["skyVS"] = CompileShader(L"Shaders\\Sky.hlsl", nullptr, "VS", "vs_5_0");
 	shaders["skyPS"] = CompileShader(L"Shaders\\Sky.hlsl", nullptr, "PS", "ps_5_0");
+	shaders["brdfLutVS"] = CompileShader(L"Shaders\\BrdfLut.hlsl", nullptr, "VS", "vs_5_0");
+	shaders["brdfLutPS"] = CompileShader(L"Shaders\\BrdfLut.hlsl", nullptr, "PS", "ps_5_0");
+	shaders["prefilterEnvVS"] = CompileShader(L"Shaders\\PrefilterEnvMap.hlsl", nullptr, "VS", "vs_5_0");
+	shaders["prefilterEnvPS"] = CompileShader(L"Shaders\\PrefilterEnvMap.hlsl", nullptr, "PS", "ps_5_0");
+	shaders["irradianceVS"] = CompileShader(L"Shaders\\IrradianceMap.hlsl", nullptr, "VS", "vs_5_0");
+	shaders["irradiancePS"] = CompileShader(L"Shaders\\IrradianceMap.hlsl", nullptr, "PS", "ps_5_0");
 
 	inputLayoutDesc1 =
 	{
@@ -421,6 +446,167 @@ void ShapesApp::BuildShadowMapResources()
 		mShadowMapDsvHeap->GetCPUDescriptorHandleForHeapStart());
 }
 
+void ShapesApp::BuildBrdfLutResources()
+{
+	mBrdfLutSrvHeapIndex = mNextSrvHeapIndex++;
+
+	D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc = {};
+	rtvHeapDesc.NumDescriptors = 1;
+	rtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+	rtvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+	rtvHeapDesc.NodeMask = 0;
+	ThrowIfFailed(md3dDevice->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(&mBrdfLutRtvHeap)));
+
+	const DXGI_FORMAT brdfLutFormat = DXGI_FORMAT_R16G16_FLOAT;
+	CD3DX12_RESOURCE_DESC brdfLutDesc = CD3DX12_RESOURCE_DESC::Tex2D(
+		brdfLutFormat,
+		BrdfLutSize,
+		BrdfLutSize,
+		1,
+		1);
+	brdfLutDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+	D3D12_CLEAR_VALUE clearValue = {};
+	clearValue.Format = brdfLutFormat;
+	clearValue.Color[0] = 0.0f;
+	clearValue.Color[1] = 0.0f;
+	clearValue.Color[2] = 0.0f;
+	clearValue.Color[3] = 0.0f;
+
+	auto heapProperties = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+	ThrowIfFailed(md3dDevice->CreateCommittedResource(
+		&heapProperties,
+		D3D12_HEAP_FLAG_NONE,
+		&brdfLutDesc,
+		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+		&clearValue,
+		IID_PPV_ARGS(&mBrdfLut)));
+
+	D3D12_RENDER_TARGET_VIEW_DESC rtvDesc = {};
+	rtvDesc.Format = brdfLutFormat;
+	rtvDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+	rtvDesc.Texture2D.MipSlice = 0;
+	rtvDesc.Texture2D.PlaneSlice = 0;
+	md3dDevice->CreateRenderTargetView(
+		mBrdfLut.Get(),
+		&rtvDesc,
+		mBrdfLutRtvHeap->GetCPUDescriptorHandleForHeapStart());
+}
+
+void ShapesApp::BuildPrefilteredEnvironmentMapResources()
+{
+	mPrefilteredEnvMapSrvHeapIndex = mNextSrvHeapIndex++;
+
+	D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc = {};
+	rtvHeapDesc.NumDescriptors = PrefilteredEnvMapMipCount * 6;
+	rtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+	rtvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+	rtvHeapDesc.NodeMask = 0;
+	ThrowIfFailed(md3dDevice->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(&mPrefilteredEnvMapRtvHeap)));
+
+	const DXGI_FORMAT prefilteredEnvFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+	CD3DX12_RESOURCE_DESC prefilteredEnvDesc = CD3DX12_RESOURCE_DESC::Tex2D(
+		prefilteredEnvFormat,
+		PrefilteredEnvMapSize,
+		PrefilteredEnvMapSize,
+		6,
+		PrefilteredEnvMapMipCount);
+	prefilteredEnvDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+	D3D12_CLEAR_VALUE clearValue = {};
+	clearValue.Format = prefilteredEnvFormat;
+	clearValue.Color[0] = 0.0f;
+	clearValue.Color[1] = 0.0f;
+	clearValue.Color[2] = 0.0f;
+	clearValue.Color[3] = 0.0f;
+
+	auto heapProperties = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+	ThrowIfFailed(md3dDevice->CreateCommittedResource(
+		&heapProperties,
+		D3D12_HEAP_FLAG_NONE,
+		&prefilteredEnvDesc,
+		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+		&clearValue,
+		IID_PPV_ARGS(&mPrefilteredEnvMap)));
+
+	D3D12_RENDER_TARGET_VIEW_DESC rtvDesc = {};
+	rtvDesc.Format = prefilteredEnvFormat;
+	rtvDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+	rtvDesc.Texture2DArray.ArraySize = 1;
+	rtvDesc.Texture2DArray.PlaneSlice = 0;
+
+	for (UINT mip = 0; mip < PrefilteredEnvMapMipCount; ++mip)
+	{
+		rtvDesc.Texture2DArray.MipSlice = mip;
+
+		for (UINT face = 0; face < 6; ++face)
+		{
+			rtvDesc.Texture2DArray.FirstArraySlice = face;
+
+			CD3DX12_CPU_DESCRIPTOR_HANDLE handle(
+				mPrefilteredEnvMapRtvHeap->GetCPUDescriptorHandleForHeapStart(),
+				static_cast<INT>(mip * 6 + face),
+				mRtvDescriptorSize);
+			md3dDevice->CreateRenderTargetView(mPrefilteredEnvMap.Get(), &rtvDesc, handle);
+		}
+	}
+}
+
+void ShapesApp::BuildIrradianceMapResources()
+{
+	mIrradianceMapSrvHeapIndex = mNextSrvHeapIndex++;
+
+	D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc = {};
+	rtvHeapDesc.NumDescriptors = 6;
+	rtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+	rtvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+	rtvHeapDesc.NodeMask = 0;
+	ThrowIfFailed(md3dDevice->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(&mIrradianceMapRtvHeap)));
+
+	const DXGI_FORMAT irradianceFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+	CD3DX12_RESOURCE_DESC irradianceDesc = CD3DX12_RESOURCE_DESC::Tex2D(
+		irradianceFormat,
+		IrradianceMapSize,
+		IrradianceMapSize,
+		6,
+		1);
+	irradianceDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+	D3D12_CLEAR_VALUE clearValue = {};
+	clearValue.Format = irradianceFormat;
+	clearValue.Color[0] = 0.0f;
+	clearValue.Color[1] = 0.0f;
+	clearValue.Color[2] = 0.0f;
+	clearValue.Color[3] = 0.0f;
+
+	auto heapProperties = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+	ThrowIfFailed(md3dDevice->CreateCommittedResource(
+		&heapProperties,
+		D3D12_HEAP_FLAG_NONE,
+		&irradianceDesc,
+		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+		&clearValue,
+		IID_PPV_ARGS(&mIrradianceMap)));
+
+	D3D12_RENDER_TARGET_VIEW_DESC rtvDesc = {};
+	rtvDesc.Format = irradianceFormat;
+	rtvDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+	rtvDesc.Texture2DArray.MipSlice = 0;
+	rtvDesc.Texture2DArray.ArraySize = 1;
+	rtvDesc.Texture2DArray.PlaneSlice = 0;
+
+	for (UINT face = 0; face < 6; ++face)
+	{
+		rtvDesc.Texture2DArray.FirstArraySlice = face;
+
+		CD3DX12_CPU_DESCRIPTOR_HANDLE handle(
+			mIrradianceMapRtvHeap->GetCPUDescriptorHandleForHeapStart(),
+			static_cast<INT>(face),
+			mRtvDescriptorSize);
+		md3dDevice->CreateRenderTargetView(mIrradianceMap.Get(), &rtvDesc, handle);
+	}
+}
+
 void ShapesApp::BuildShaderResourceView()
 {
 	D3D12_DESCRIPTOR_HEAP_DESC srvHeapDesc = {};
@@ -475,6 +661,57 @@ void ShapesApp::BuildShaderResourceView()
 			mCbvSrvUavDescriptorSize);
 		md3dDevice->CreateShaderResourceView(mShadowMap.Get(), &shadowSrvDesc, handle);
 	}
+
+	if (mBrdfLut != nullptr && mBrdfLutSrvHeapIndex != std::numeric_limits<UINT>::max())
+	{
+		D3D12_SHADER_RESOURCE_VIEW_DESC brdfLutSrvDesc = {};
+		brdfLutSrvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		brdfLutSrvDesc.Format = DXGI_FORMAT_R16G16_FLOAT;
+		brdfLutSrvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+		brdfLutSrvDesc.Texture2D.MostDetailedMip = 0;
+		brdfLutSrvDesc.Texture2D.MipLevels = 1;
+		brdfLutSrvDesc.Texture2D.ResourceMinLODClamp = 0.0f;
+
+		CD3DX12_CPU_DESCRIPTOR_HANDLE handle(
+			mSrvHeap->GetCPUDescriptorHandleForHeapStart(),
+			mBrdfLutSrvHeapIndex,
+			mCbvSrvUavDescriptorSize);
+		md3dDevice->CreateShaderResourceView(mBrdfLut.Get(), &brdfLutSrvDesc, handle);
+	}
+
+	if (mPrefilteredEnvMap != nullptr && mPrefilteredEnvMapSrvHeapIndex != std::numeric_limits<UINT>::max())
+	{
+		D3D12_SHADER_RESOURCE_VIEW_DESC prefilteredEnvSrvDesc = {};
+		prefilteredEnvSrvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		prefilteredEnvSrvDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+		prefilteredEnvSrvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+		prefilteredEnvSrvDesc.TextureCube.MostDetailedMip = 0;
+		prefilteredEnvSrvDesc.TextureCube.MipLevels = PrefilteredEnvMapMipCount;
+		prefilteredEnvSrvDesc.TextureCube.ResourceMinLODClamp = 0.0f;
+
+		CD3DX12_CPU_DESCRIPTOR_HANDLE handle(
+			mSrvHeap->GetCPUDescriptorHandleForHeapStart(),
+			mPrefilteredEnvMapSrvHeapIndex,
+			mCbvSrvUavDescriptorSize);
+		md3dDevice->CreateShaderResourceView(mPrefilteredEnvMap.Get(), &prefilteredEnvSrvDesc, handle);
+	}
+
+	if (mIrradianceMap != nullptr && mIrradianceMapSrvHeapIndex != std::numeric_limits<UINT>::max())
+	{
+		D3D12_SHADER_RESOURCE_VIEW_DESC irradianceSrvDesc = {};
+		irradianceSrvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		irradianceSrvDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+		irradianceSrvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+		irradianceSrvDesc.TextureCube.MostDetailedMip = 0;
+		irradianceSrvDesc.TextureCube.MipLevels = 1;
+		irradianceSrvDesc.TextureCube.ResourceMinLODClamp = 0.0f;
+
+		CD3DX12_CPU_DESCRIPTOR_HANDLE handle(
+			mSrvHeap->GetCPUDescriptorHandleForHeapStart(),
+			mIrradianceMapSrvHeapIndex,
+			mCbvSrvUavDescriptorSize);
+		md3dDevice->CreateShaderResourceView(mIrradianceMap.Get(), &irradianceSrvDesc, handle);
+	}
 }
 
 void ShapesApp::BuildPSO()
@@ -519,6 +756,39 @@ void ShapesApp::BuildPSO()
 	skyPsoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
 	ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&skyPsoDesc, IID_PPV_ARGS(&mPSOs["sky"])));
 
+	D3D12_GRAPHICS_PIPELINE_STATE_DESC brdfLutPsoDesc = psoDesc;
+	brdfLutPsoDesc.InputLayout = { nullptr, 0 };
+	brdfLutPsoDesc.VS = { reinterpret_cast<BYTE*>(shaders["brdfLutVS"]->GetBufferPointer()), shaders["brdfLutVS"]->GetBufferSize() };
+	brdfLutPsoDesc.PS = { reinterpret_cast<BYTE*>(shaders["brdfLutPS"]->GetBufferPointer()), shaders["brdfLutPS"]->GetBufferSize() };
+	brdfLutPsoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+	brdfLutPsoDesc.DepthStencilState.DepthEnable = false;
+	brdfLutPsoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+	brdfLutPsoDesc.DSVFormat = DXGI_FORMAT_UNKNOWN;
+	brdfLutPsoDesc.RTVFormats[0] = DXGI_FORMAT_R16G16_FLOAT;
+	ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&brdfLutPsoDesc, IID_PPV_ARGS(&mPSOs["brdfLut"])));
+
+	D3D12_GRAPHICS_PIPELINE_STATE_DESC prefilterEnvPsoDesc = psoDesc;
+	prefilterEnvPsoDesc.InputLayout = { nullptr, 0 };
+	prefilterEnvPsoDesc.VS = { reinterpret_cast<BYTE*>(shaders["prefilterEnvVS"]->GetBufferPointer()), shaders["prefilterEnvVS"]->GetBufferSize() };
+	prefilterEnvPsoDesc.PS = { reinterpret_cast<BYTE*>(shaders["prefilterEnvPS"]->GetBufferPointer()), shaders["prefilterEnvPS"]->GetBufferSize() };
+	prefilterEnvPsoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+	prefilterEnvPsoDesc.DepthStencilState.DepthEnable = false;
+	prefilterEnvPsoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+	prefilterEnvPsoDesc.DSVFormat = DXGI_FORMAT_UNKNOWN;
+	prefilterEnvPsoDesc.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+	ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&prefilterEnvPsoDesc, IID_PPV_ARGS(&mPSOs["prefilterEnv"])));
+
+	D3D12_GRAPHICS_PIPELINE_STATE_DESC irradiancePsoDesc = psoDesc;
+	irradiancePsoDesc.InputLayout = { nullptr, 0 };
+	irradiancePsoDesc.VS = { reinterpret_cast<BYTE*>(shaders["irradianceVS"]->GetBufferPointer()), shaders["irradianceVS"]->GetBufferSize() };
+	irradiancePsoDesc.PS = { reinterpret_cast<BYTE*>(shaders["irradiancePS"]->GetBufferPointer()), shaders["irradiancePS"]->GetBufferSize() };
+	irradiancePsoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+	irradiancePsoDesc.DepthStencilState.DepthEnable = false;
+	irradiancePsoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+	irradiancePsoDesc.DSVFormat = DXGI_FORMAT_UNKNOWN;
+	irradiancePsoDesc.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+	ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&irradiancePsoDesc, IID_PPV_ARGS(&mPSOs["irradiance"])));
+
 	D3D12_GRAPHICS_PIPELINE_STATE_DESC treeBillboardPsoDesc = psoDesc;
 	treeBillboardPsoDesc.InputLayout = { treeBillboardInputLayoutDesc.data(), static_cast<UINT>(treeBillboardInputLayoutDesc.size()) };
 	treeBillboardPsoDesc.VS = { reinterpret_cast<BYTE*>(shaders["treeBillboardVS"]->GetBufferPointer()), shaders["treeBillboardVS"]->GetBufferSize() };
@@ -527,6 +797,138 @@ void ShapesApp::BuildPSO()
 	treeBillboardPsoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
 	treeBillboardPsoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
 	ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&treeBillboardPsoDesc, IID_PPV_ARGS(&mPSOs["treeBillboard"])));
+}
+
+void ShapesApp::RenderBrdfLut()
+{
+	auto barrierToRenderTarget = CD3DX12_RESOURCE_BARRIER::Transition(
+		mBrdfLut.Get(),
+		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+		D3D12_RESOURCE_STATE_RENDER_TARGET);
+	mCommandList->ResourceBarrier(1, &barrierToRenderTarget);
+
+	mCommandList->RSSetViewports(1, &mBrdfLutViewport);
+	mCommandList->RSSetScissorRects(1, &mBrdfLutScissorRect);
+
+	D3D12_CPU_DESCRIPTOR_HANDLE brdfLutRtvHandle = mBrdfLutRtvHeap->GetCPUDescriptorHandleForHeapStart();
+	const float clearColor[] = { 0.0f, 0.0f, 0.0f, 0.0f };
+	mCommandList->ClearRenderTargetView(brdfLutRtvHandle, clearColor, 0, nullptr);
+	mCommandList->OMSetRenderTargets(1, &brdfLutRtvHandle, false, nullptr);
+
+	mCommandList->SetGraphicsRootSignature(mRootSignature.Get());
+	mCommandList->SetPipelineState(mPSOs["brdfLut"].Get());
+	mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	mCommandList->DrawInstanced(3, 1, 0, 0);
+
+	auto barrierToShaderResource = CD3DX12_RESOURCE_BARRIER::Transition(
+		mBrdfLut.Get(),
+		D3D12_RESOURCE_STATE_RENDER_TARGET,
+		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+	mCommandList->ResourceBarrier(1, &barrierToShaderResource);
+}
+
+void ShapesApp::RenderPrefilteredEnvironmentMap()
+{
+	auto barrierToRenderTarget = CD3DX12_RESOURCE_BARRIER::Transition(
+		mPrefilteredEnvMap.Get(),
+		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+		D3D12_RESOURCE_STATE_RENDER_TARGET);
+	mCommandList->ResourceBarrier(1, &barrierToRenderTarget);
+
+	ID3D12DescriptorHeap* descriptorHeaps[] = { mSrvHeap.Get() };
+	mCommandList->SetDescriptorHeaps(_countof(descriptorHeaps), descriptorHeaps);
+	mCommandList->SetGraphicsRootSignature(mRootSignature.Get());
+	mCommandList->SetPipelineState(mPSOs["prefilterEnv"].Get());
+	mCommandList->SetGraphicsRootDescriptorTable(7, [&]()
+	{
+		CD3DX12_GPU_DESCRIPTOR_HANDLE handle(mSrvHeap->GetGPUDescriptorHandleForHeapStart());
+		handle.Offset(textures[mEnvironmentTextureName]->srvHeapIndex, mCbvSrvUavDescriptorSize);
+		return handle;
+	}());
+	mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+	for (UINT mip = 0; mip < PrefilteredEnvMapMipCount; ++mip)
+	{
+		const UINT mipSize = std::max<UINT>(1, PrefilteredEnvMapSize >> mip);
+		D3D12_VIEWPORT viewport = { 0.0f, 0.0f, static_cast<float>(mipSize), static_cast<float>(mipSize), 0.0f, 1.0f };
+		D3D12_RECT scissorRect = { 0, 0, static_cast<LONG>(mipSize), static_cast<LONG>(mipSize) };
+		mCommandList->RSSetViewports(1, &viewport);
+		mCommandList->RSSetScissorRects(1, &scissorRect);
+
+		const float roughness = PrefilteredEnvMapMipCount > 1
+			? static_cast<float>(mip) / static_cast<float>(PrefilteredEnvMapMipCount - 1)
+			: 0.0f;
+
+		for (UINT face = 0; face < 6; ++face)
+		{
+			const float prefilterConstants[2] = { roughness, static_cast<float>(face) };
+			mCommandList->SetGraphicsRoot32BitConstants(12, _countof(prefilterConstants), prefilterConstants, 0);
+
+			CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(
+				mPrefilteredEnvMapRtvHeap->GetCPUDescriptorHandleForHeapStart(),
+				static_cast<INT>(mip * 6 + face),
+				mRtvDescriptorSize);
+
+			const float clearColor[] = { 0.0f, 0.0f, 0.0f, 0.0f };
+			mCommandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
+			mCommandList->OMSetRenderTargets(1, &rtvHandle, false, nullptr);
+			mCommandList->DrawInstanced(3, 1, 0, 0);
+		}
+	}
+
+	auto barrierToShaderResource = CD3DX12_RESOURCE_BARRIER::Transition(
+		mPrefilteredEnvMap.Get(),
+		D3D12_RESOURCE_STATE_RENDER_TARGET,
+		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+	mCommandList->ResourceBarrier(1, &barrierToShaderResource);
+}
+
+void ShapesApp::RenderIrradianceMap()
+{
+	auto barrierToRenderTarget = CD3DX12_RESOURCE_BARRIER::Transition(
+		mIrradianceMap.Get(),
+		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+		D3D12_RESOURCE_STATE_RENDER_TARGET);
+	mCommandList->ResourceBarrier(1, &barrierToRenderTarget);
+
+	ID3D12DescriptorHeap* descriptorHeaps[] = { mSrvHeap.Get() };
+	mCommandList->SetDescriptorHeaps(_countof(descriptorHeaps), descriptorHeaps);
+	mCommandList->SetGraphicsRootSignature(mRootSignature.Get());
+	mCommandList->SetPipelineState(mPSOs["irradiance"].Get());
+	mCommandList->SetGraphicsRootDescriptorTable(7, [&]()
+	{
+		CD3DX12_GPU_DESCRIPTOR_HANDLE handle(mSrvHeap->GetGPUDescriptorHandleForHeapStart());
+		handle.Offset(textures[mEnvironmentTextureName]->srvHeapIndex, mCbvSrvUavDescriptorSize);
+		return handle;
+	}());
+	mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+	D3D12_VIEWPORT viewport = { 0.0f, 0.0f, static_cast<float>(IrradianceMapSize), static_cast<float>(IrradianceMapSize), 0.0f, 1.0f };
+	D3D12_RECT scissorRect = { 0, 0, static_cast<LONG>(IrradianceMapSize), static_cast<LONG>(IrradianceMapSize) };
+	mCommandList->RSSetViewports(1, &viewport);
+	mCommandList->RSSetScissorRects(1, &scissorRect);
+
+	for (UINT face = 0; face < 6; ++face)
+	{
+		const float irradianceConstants[2] = { 0.0f, static_cast<float>(face) };
+		mCommandList->SetGraphicsRoot32BitConstants(12, _countof(irradianceConstants), irradianceConstants, 0);
+
+		CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(
+			mIrradianceMapRtvHeap->GetCPUDescriptorHandleForHeapStart(),
+			static_cast<INT>(face),
+			mRtvDescriptorSize);
+
+		const float clearColor[] = { 0.0f, 0.0f, 0.0f, 0.0f };
+		mCommandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
+		mCommandList->OMSetRenderTargets(1, &rtvHandle, false, nullptr);
+		mCommandList->DrawInstanced(3, 1, 0, 0);
+	}
+
+	auto barrierToShaderResource = CD3DX12_RESOURCE_BARRIER::Transition(
+		mIrradianceMap.Get(),
+		D3D12_RESOURCE_STATE_RENDER_TARGET,
+		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+	mCommandList->ResourceBarrier(1, &barrierToShaderResource);
 }
 
 void ShapesApp::BuildShapeGeometry()
@@ -1243,6 +1645,7 @@ void ShapesApp::UpdatePassCBs(const GameTimer& gt)
 	passConstants.totalTime = gt.TotalTime();
 	passConstants.ambientLight = { 0.012f, 0.012f, 0.016f, 1.0f };
 	passConstants.envMapMipCount = static_cast<float>(textures[mEnvironmentTextureName]->resource->GetDesc().MipLevels);
+	passConstants.prefilteredEnvMapMipCount = static_cast<float>(PrefilteredEnvMapMipCount);
 	passConstants.iblStrength = 0.6f;
 
 	for (int i = 0; i < MAX_LIGHTS; ++i)

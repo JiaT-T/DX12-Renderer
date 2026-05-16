@@ -200,6 +200,11 @@
     <Image Include="WindowsProject1.ico" />
   </ItemGroup>
   <ItemGroup>
+    <None Include="Shaders\BrdfLut.hlsl">
+      <FileType>Document</FileType>
+    </None>
+  </ItemGroup>
+  <ItemGroup>
     <None Include="Shaders\Color.hlsl">
       <FileType>Document</FileType>
     </None>
@@ -209,6 +214,16 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="Shaders\LightingTools.hlsl">
+      <FileType>Document</FileType>
+    </None>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="Shaders\IrradianceMap.hlsl">
+      <FileType>Document</FileType>
+    </None>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="Shaders\PrefilterEnvMap.hlsl">
       <FileType>Document</FileType>
     </None>
   </ItemGroup>

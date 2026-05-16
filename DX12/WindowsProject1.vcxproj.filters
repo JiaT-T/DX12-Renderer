@@ -137,10 +137,19 @@
     </Image>
   </ItemGroup>
   <ItemGroup>
+    <None Include="Shaders\BrdfLut.hlsl">
+      <Filter>源文件\Shaders</Filter>
+    </None>
     <None Include="Shaders\Color.hlsl">
       <Filter>源文件\Shaders</Filter>
     </None>
     <None Include="Shaders\LightingTools.hlsl">
+      <Filter>源文件\Shaders</Filter>
+    </None>
+    <None Include="Shaders\IrradianceMap.hlsl">
+      <Filter>源文件\Shaders</Filter>
+    </None>
+    <None Include="Shaders\PrefilterEnvMap.hlsl">
       <Filter>源文件\Shaders</Filter>
     </None>
     <None Include="Shaders\ShadowMap.hlsl">

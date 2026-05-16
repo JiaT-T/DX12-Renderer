@@ -39,8 +39,9 @@ cbuffer cbPass : register(b2)
     float4 gAmbientLight;
     Light gLights[MAX_LIGHTS];
     float gEnvMapMipCount;
+    float gPrefilteredEnvMapMipCount;
     float gIblStrength;
-    float2 gPassPadding;
+    float gPassPadding;
 };
 
 struct VertexIn
@@ -57,6 +58,9 @@ Texture2D gRoughnessMap : register(t2);
 Texture2D gMetallicMap : register(t3);
 Texture2D gEnvMap : register(t4);
 Texture2D gShadowMap : register(t5);
+Texture2D gBrdfLut : register(t6);
+TextureCube gPrefilteredEnvMap : register(t7);
+TextureCube gIrradianceMap : register(t8);
 
 SamplerState samPointWarp         : register(s0);
 SamplerState samPointClamp        : register(s1);
@@ -89,16 +93,6 @@ float3 SampleNormalWS(float3 baseNormalWS, float4 tangentWS, float2 texC)
     float3 bitangentWS = tangentWS.w * normalize(cross(normalWS, tangentDirWS));
     float3x3 tbn = float3x3(tangentDirWS, bitangentWS, normalWS);
     return normalize(mul(tangentNormal, tbn));
-}
-
-float3 EnvBRDFApprox(float3 specularColor, float roughness, float NdotV)
-{
-    const float4 c0 = float4(-1.0f, -0.0275f, -0.572f, 0.022f);
-    const float4 c1 = float4(1.0f, 0.0425f, 1.04f, -0.04f);
-    float4 r = roughness * c0 + c1;
-    float a004 = min(r.x * r.x, exp2(-9.28f * NdotV)) * r.x + r.y;
-    float2 AB = float2(-1.04f, 1.04f) * a004 + r.zw;
-    return specularColor * AB.x + AB.y;
 }
 
 float3 ToneMapACES(float3 color)
@@ -206,11 +200,12 @@ float4 PS(VertexOut i) : SV_TARGET
     float3 kS = FresnelSchlickRoughness(NdotV, F0, roughness);
     float3 kD = (1.0f - kS) * (1.0f - metallic);
 
-    float envMip = max(gEnvMapMipCount - 1.0f, 0.0f);
-    float3 diffuseEnv = SampleEnvironment(normalWS, envMip);
+    float3 diffuseEnv = gIrradianceMap.SampleLevel(samLinearClamp, normalWS, 0.0f).rgb;
     float3 reflectDir = reflect(-viewDirWS, normalWS);
-    float3 prefilteredEnv = SampleEnvironment(reflectDir, roughness * envMip);
-    float3 specularIBL = prefilteredEnv * EnvBRDFApprox(F0, roughness, NdotV);
+    float prefilteredMip = roughness * max(gPrefilteredEnvMapMipCount - 1.0f, 0.0f);
+    float3 prefilteredEnv = gPrefilteredEnvMap.SampleLevel(samLinearClamp, reflectDir, prefilteredMip).rgb;
+    float2 envBrdf = gBrdfLut.Sample(samLinearClamp, float2(NdotV, roughness)).rg;
+    float3 specularIBL = prefilteredEnv * (F0 * envBrdf.x + envBrdf.y);
     float3 diffuseIBL = diffuseEnv * baseColor.rgb * kD;
 
     float3 ambientFallback = gAmbientLight.rgb * baseColor.rgb * kD;
