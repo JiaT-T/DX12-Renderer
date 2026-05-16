@@ -100,8 +100,14 @@ public:
 	void BuildRootSignature();
 	void BuildByteCodeAndInputLayout();
 	void BuildShadowMapResources();
+	void BuildBrdfLutResources();
+	void BuildPrefilteredEnvironmentMapResources();
+	void BuildIrradianceMapResources();
 	void BuildShaderResourceView();
 	void BuildPSO();
+	void RenderBrdfLut();
+	void RenderPrefilteredEnvironmentMap();
+	void RenderIrradianceMap();
 
 	void BuildShapeGeometry();
 	void BuildSkull();
@@ -142,6 +148,9 @@ protected:
 	std::string mEnvironmentTextureName = "suburbanGardenHdrTex";
 	UINT mNextSrvHeapIndex = 0;
 	UINT mShadowMapSrvHeapIndex = std::numeric_limits<UINT>::max();
+	UINT mBrdfLutSrvHeapIndex = std::numeric_limits<UINT>::max();
+	UINT mPrefilteredEnvMapSrvHeapIndex = std::numeric_limits<UINT>::max();
+	UINT mIrradianceMapSrvHeapIndex = std::numeric_limits<UINT>::max();
 
 	ComPtr<ID3D12RootSignature> mRootSignature = nullptr;
 
@@ -154,7 +163,13 @@ protected:
 
 	ComPtr<ID3D12DescriptorHeap> mSrvHeap = nullptr;
 	ComPtr<ID3D12DescriptorHeap> mShadowMapDsvHeap = nullptr;
+	ComPtr<ID3D12DescriptorHeap> mBrdfLutRtvHeap = nullptr;
+	ComPtr<ID3D12DescriptorHeap> mPrefilteredEnvMapRtvHeap = nullptr;
+	ComPtr<ID3D12DescriptorHeap> mIrradianceMapRtvHeap = nullptr;
 	ComPtr<ID3D12Resource> mShadowMap = nullptr;
+	ComPtr<ID3D12Resource> mBrdfLut = nullptr;
+	ComPtr<ID3D12Resource> mPrefilteredEnvMap = nullptr;
+	ComPtr<ID3D12Resource> mIrradianceMap = nullptr;
 	std::unordered_map<std::string, Microsoft::WRL::ComPtr<ID3D12PipelineState>> mPSOs;
 
 	UINT totalByteSize = 0;
@@ -174,8 +189,14 @@ protected:
 	std::vector<RenderItem*> mRitemLayer[(int)RenderLayer::Count];
 
 	static constexpr UINT ShadowMapSize = 2048;
+	static constexpr UINT BrdfLutSize = 256;
+	static constexpr UINT PrefilteredEnvMapSize = 128;
+	static constexpr UINT PrefilteredEnvMapMipCount = 8;
+	static constexpr UINT IrradianceMapSize = 32;
 	D3D12_VIEWPORT mShadowViewport = { 0.0f, 0.0f, static_cast<float>(ShadowMapSize), static_cast<float>(ShadowMapSize), 0.0f, 1.0f };
 	D3D12_RECT mShadowScissorRect = { 0, 0, static_cast<LONG>(ShadowMapSize), static_cast<LONG>(ShadowMapSize) };
+	D3D12_VIEWPORT mBrdfLutViewport = { 0.0f, 0.0f, static_cast<float>(BrdfLutSize), static_cast<float>(BrdfLutSize), 0.0f, 1.0f };
+	D3D12_RECT mBrdfLutScissorRect = { 0, 0, static_cast<LONG>(BrdfLutSize), static_cast<LONG>(BrdfLutSize) };
 	XMFLOAT3 mSceneBoundsCenter = { 0.0f, 1.0f, 0.0f };
 	float mSceneBoundsRadius = 16.0f;
 

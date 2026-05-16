@@ -1,6 +1,6 @@
 # DX12 Renderer
 
-一个基于 DirectX 12 的实时渲染项目，当前实现重点围绕金属度-粗糙度 PBR、HDR 环境光照以及真实阴影映射展开。项目代码位于 [`DX12/`](./DX12) 目录。
+一个基于 DirectX 12 的实时渲染项目，当前实现重点围绕金属度-粗糙度 PBR、基于 split-sum approximation 的 IBL 预计算流程以及真实阴影映射展开。项目代码位于 [`DX12/`](./DX12) 目录。
 
 ## 当前特性
 
@@ -21,7 +21,10 @@
 - 基于 HDR 经纬图的环境光照
   - HDR 浮点纹理加载
   - 环境贴图 mip 链生成
-  - diffuse / specular IBL 近似采样
+  - `irradiance map`
+  - `prefiltered environment map`
+  - `BRDF LUT`
+  - 基于 split-sum approximation 的 diffuse / specular IBL
   - HDR 天空背景显示
 - 真实阴影映射
   - 独立 shadow map 深度预通道
@@ -46,6 +49,9 @@
 当前使用的主要测试资源包括：
 
 - [`DX12/Shaders/Color.hlsl`](./DX12/Shaders/Color.hlsl)
+- [`DX12/Shaders/BrdfLut.hlsl`](./DX12/Shaders/BrdfLut.hlsl)
+- [`DX12/Shaders/IrradianceMap.hlsl`](./DX12/Shaders/IrradianceMap.hlsl)
+- [`DX12/Shaders/PrefilterEnvMap.hlsl`](./DX12/Shaders/PrefilterEnvMap.hlsl)
 - [`DX12/Shaders/ShadowMap.hlsl`](./DX12/Shaders/ShadowMap.hlsl)
 - [`DX12/Shaders/Sky.hlsl`](./DX12/Shaders/Sky.hlsl)
 - `D:/Computer Graphics/PathTracer/PathTracer-CPP/images/Metal1`
@@ -55,15 +61,19 @@
 
 当前主渲染流程可以概括为：
 
-1. 渲染 shadow map 深度预通道
-2. 渲染 HDR 天空背景
-3. 渲染主场景物体
-4. 在主着色阶段综合：
+1. 启动阶段生成 IBL 预计算资源
+   - irradiance map
+   - prefiltered environment map
+   - BRDF LUT
+2. 渲染 shadow map 深度预通道
+3. 渲染 HDR 天空背景
+4. 渲染主场景物体
+5. 在主着色阶段综合：
    - 直接光照
    - shadow map 阴影
    - diffuse IBL
    - specular IBL
-5. 输出前执行 tone mapping 与 gamma correction
+6. 输出前执行 tone mapping 与 gamma correction
 
 ## 关键实现文件
 
@@ -79,6 +89,12 @@
   - PBR 直接光照核心计算
 - [`DX12/Shaders/Color.hlsl`](./DX12/Shaders/Color.hlsl)
   - 主着色器、法线贴图、IBL、阴影采样
+- [`DX12/Shaders/BrdfLut.hlsl`](./DX12/Shaders/BrdfLut.hlsl)
+  - BRDF 积分查找表预计算
+- [`DX12/Shaders/IrradianceMap.hlsl`](./DX12/Shaders/IrradianceMap.hlsl)
+  - diffuse IBL 半球卷积预计算
+- [`DX12/Shaders/PrefilterEnvMap.hlsl`](./DX12/Shaders/PrefilterEnvMap.hlsl)
+  - specular IBL 的 GGX 预滤波环境贴图生成
 - [`DX12/Shaders/ShadowMap.hlsl`](./DX12/Shaders/ShadowMap.hlsl)
   - 阴影贴图深度预通道
 - [`DX12/Shaders/Sky.hlsl`](./DX12/Shaders/Sky.hlsl)
@@ -117,16 +133,12 @@
 
 ## 当前限制
 
-当前实现已经具备一条完整的实时 PBR 验证链路，但仍属于 forward renderer 的阶段性版本。后续仍可继续扩展：
+当前实现已经具备一条较完整的实时 PBR 主链路，包括基于 split-sum approximation 的 IBL 预计算流程，但仍属于 forward renderer 的阶段性版本。后续仍可继续扩展：
 
-- 更标准的 IBL 预计算流程
-  - irradiance map
-  - prefiltered environment map
-  - BRDF LUT
 - 更完整的场景资源组织
 - `SSAO / SSR / SSGI`
 - `DXR`
 
 ## 项目定位
 
-该项目用于验证实时渲染中的核心基础模块如何在 DirectX 12 中完成工程化落地，包括资源管理、材质系统、环境光照、阴影映射与着色器协作。当前版本已经能够较完整地展示一条可运行的实时 PBR 主链路，并为后续扩展更复杂的实时渲染特性提供基础。
+该项目用于验证实时渲染中的核心基础模块如何在 DirectX 12 中完成工程化落地，包括资源管理、材质系统、基于 IBL 的环境光照、阴影映射与着色器协作。当前版本已经能够较完整地展示一条可运行的实时 PBR 主链路，并为后续扩展更复杂的实时渲染特性提供基础。

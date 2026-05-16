@@ -29,8 +29,9 @@ struct PassConstants
 	XMFLOAT4 ambientLight = { 0.0f,0.0f,0.0f,1.0f };
 	Light lights[MAX_LIGHTS];
 	float envMapMipCount = 1.0f;
+	float prefilteredEnvMapMipCount = 1.0f;
 	float iblStrength = 1.0f;
-	XMFLOAT2 passPadding = { 0.0f, 0.0f };
+	float passPadding = 0.0f;
 };
 
 struct MatConstants
