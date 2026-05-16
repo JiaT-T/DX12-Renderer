@@ -102,15 +102,11 @@ bool ShapesApp::InitRnederItems(HINSTANCE hInstance, int nShowCmd, std::wstring 
 	BuildRootSignature();
 	BuildByteCodeAndInputLayout();
 	BuildShapeGeometry();
-	BuildSkull();
-	BuildBoxGeometry();
-	BuildGridGeomerty();
-	BuildTreeBillboardGeometry();
 	LoadTextures();
 	BuildMaterial();
-	BuildImportedPbrSphere();
 	BuildRenderItems();
 	BuildFrameResource();
+	BuildShadowMapResources();
 
 	mCurrentFrameResourcesIndex = 0;
 	mCurrentFrameResources = mFrameResourcesArray[mCurrentFrameResourcesIndex].get();
@@ -132,6 +128,16 @@ void ShapesApp::Draw()
 	auto currentCmdAllocator = mCurrentFrameResources->mCmdAllocator;
 	ThrowIfFailed(currentCmdAllocator->Reset());
 	ThrowIfFailed(mCommandList->Reset(currentCmdAllocator.Get(), mPSOs["opaque"].Get()));
+
+	ID3D12DescriptorHeap* descriptorHeaps[] = { mSrvHeap.Get() };
+	mCommandList->SetDescriptorHeaps(_countof(descriptorHeaps), descriptorHeaps);
+	mCommandList->SetGraphicsRootSignature(mRootSignature.Get());
+
+	const D3D12_GPU_VIRTUAL_ADDRESS passCBAddress =
+		mCurrentFrameResources->passCB->GetResource()->GetGPUVirtualAddress();
+
+	mCommandList->SetGraphicsRootConstantBufferView(2, passCBAddress);
+	DrawSceneToShadowMap();
 
 	auto barrierToRender = CD3DX12_RESOURCE_BARRIER::Transition(
 		mSwapChainBuffer[mCurrentBackBuffer].Get(),
@@ -160,37 +166,16 @@ void ShapesApp::Draw()
 
 	mCommandList->OMSetRenderTargets(1, &rtvHandle, true, &dsvHandle);
 
-	ID3D12DescriptorHeap* descriptorHeaps[] = { mSrvHeap.Get() };
-	mCommandList->SetDescriptorHeaps(_countof(descriptorHeaps), descriptorHeaps);
-	mCommandList->SetGraphicsRootSignature(mRootSignature.Get());
-
-	const UINT passCBByteSize = CalcConstantBufferByteSize(sizeof(PassConstants));
-	const D3D12_GPU_VIRTUAL_ADDRESS passCBAddress =
-		mCurrentFrameResources->passCB->GetResource()->GetGPUVirtualAddress();
-	const D3D12_GPU_VIRTUAL_ADDRESS reflectPassCBAddress = passCBAddress + passCBByteSize;
-
 	mCommandList->SetGraphicsRootConstantBufferView(2, passCBAddress);
+	mCommandList->SetPipelineState(mPSOs["sky"].Get());
+	DrawRenderItems(mRitemLayer[(int)RenderLayer::Sky]);
+
+	CD3DX12_GPU_DESCRIPTOR_HANDLE shadowSrvHandle(mSrvHeap->GetGPUDescriptorHandleForHeapStart());
+	shadowSrvHandle.Offset(mShadowMapSrvHeapIndex, mCbvSrvUavDescriptorSize);
+	mCommandList->SetGraphicsRootDescriptorTable(8, shadowSrvHandle);
+
 	mCommandList->SetPipelineState(mPSOs["opaque"].Get());
 	DrawRenderItems(mRitemLayer[(int)RenderLayer::Opaque]);
-
-	mCommandList->SetPipelineState(mPSOs["treeBillboard"].Get());
-	DrawRenderItems(mRitemLayer[(int)RenderLayer::AlphaTest]);
-
-	mCommandList->OMSetStencilRef(1);
-	mCommandList->SetPipelineState(mPSOs["markStencilMirror"].Get());
-	DrawRenderItems(mRitemLayer[(int)RenderLayer::Mirrors]);
-
-	mCommandList->SetGraphicsRootConstantBufferView(2, reflectPassCBAddress);
-	mCommandList->SetPipelineState(mPSOs["drawStencilReflections"].Get());
-	DrawRenderItems(mRitemLayer[(int)RenderLayer::Reflect]);
-
-	mCommandList->SetGraphicsRootConstantBufferView(2, passCBAddress);
-	mCommandList->OMSetStencilRef(0);
-	mCommandList->SetPipelineState(mPSOs["transparent"].Get());
-	DrawRenderItems(mRitemLayer[(int)RenderLayer::Transparent]);
-
-	mCommandList->SetPipelineState(mPSOs["shadow"].Get());
-	DrawRenderItems(mRitemLayer[(int)RenderLayer::Shadow]);
 
 	auto barrierToPresent = CD3DX12_RESOURCE_BARRIER::Transition(
 		mSwapChainBuffer[mCurrentBackBuffer].Get(),
@@ -207,6 +192,31 @@ void ShapesApp::Draw()
 
 	mCurrentFrameResources->mFenceCPU = ++mCurrentFence;
 	mCommandQueue->Signal(mFence.Get(), mCurrentFence);
+}
+
+void ShapesApp::DrawSceneToShadowMap()
+{
+	auto barrierToDepthWrite = CD3DX12_RESOURCE_BARRIER::Transition(
+		mShadowMap.Get(),
+		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+		D3D12_RESOURCE_STATE_DEPTH_WRITE);
+	mCommandList->ResourceBarrier(1, &barrierToDepthWrite);
+
+	mCommandList->RSSetViewports(1, &mShadowViewport);
+	mCommandList->RSSetScissorRects(1, &mShadowScissorRect);
+
+	D3D12_CPU_DESCRIPTOR_HANDLE shadowDsvHandle = mShadowMapDsvHeap->GetCPUDescriptorHandleForHeapStart();
+	mCommandList->ClearDepthStencilView(shadowDsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+	mCommandList->OMSetRenderTargets(0, nullptr, false, &shadowDsvHandle);
+
+	mCommandList->SetPipelineState(mPSOs["shadowMap"].Get());
+	DrawRenderItems(mRitemLayer[(int)RenderLayer::Opaque]);
+
+	auto barrierToShaderResource = CD3DX12_RESOURCE_BARRIER::Transition(
+		mShadowMap.Get(),
+		D3D12_RESOURCE_STATE_DEPTH_WRITE,
+		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+	mCommandList->ResourceBarrier(1, &barrierToShaderResource);
 }
 
 void ShapesApp::DrawRenderItems(const std::vector<RenderItem*>& ritems)
@@ -249,6 +259,7 @@ void ShapesApp::DrawRenderItems(const std::vector<RenderItem*>& ritems)
 		D3D12_GPU_VIRTUAL_ADDRESS objCBAddress = mCurrentFrameResources->objCB->GetResource()->GetGPUVirtualAddress();
 		objCBAddress += static_cast<UINT64>(ritem->mObjCBIndex) * objConstSize;
 		mCommandList->SetGraphicsRootConstantBufferView(0, objCBAddress);
+		mCommandList->SetGraphicsRootDescriptorTable(7, makeSrvHandle(textures[mEnvironmentTextureName]->srvHeapIndex));
 
 		if (ritem->mat != nullptr)
 		{
@@ -260,7 +271,6 @@ void ShapesApp::DrawRenderItems(const std::vector<RenderItem*>& ritems)
 			mCommandList->SetGraphicsRootDescriptorTable(4, makeSrvHandle(ritem->mat->normalSrvHeapIndex));
 			mCommandList->SetGraphicsRootDescriptorTable(5, makeSrvHandle(ritem->mat->roughnessSrvHeapIndex));
 			mCommandList->SetGraphicsRootDescriptorTable(6, makeSrvHandle(ritem->mat->metallicSrvHeapIndex));
-			mCommandList->SetGraphicsRootDescriptorTable(7, makeSrvHandle(textures[mEnvironmentTextureName]->srvHeapIndex));
 		}
 
 		mCommandList->DrawIndexedInstanced(
@@ -281,7 +291,7 @@ void ShapesApp::OnResize()
 
 void ShapesApp::BuildRootSignature()
 {
-	CD3DX12_ROOT_PARAMETER rootParameters[8];
+	CD3DX12_ROOT_PARAMETER rootParameters[9];
 	rootParameters[0].InitAsConstantBufferView(0);
 	rootParameters[1].InitAsConstantBufferView(1);
 	rootParameters[2].InitAsConstantBufferView(2);
@@ -291,18 +301,21 @@ void ShapesApp::BuildRootSignature()
 	CD3DX12_DESCRIPTOR_RANGE roughnessSrvTable;
 	CD3DX12_DESCRIPTOR_RANGE metallicSrvTable;
 	CD3DX12_DESCRIPTOR_RANGE envSrvTable;
+	CD3DX12_DESCRIPTOR_RANGE shadowMapSrvTable;
 
 	baseColorSrvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
 	normalSrvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1);
 	roughnessSrvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2);
 	metallicSrvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 3);
 	envSrvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 4);
+	shadowMapSrvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 5);
 
 	rootParameters[3].InitAsDescriptorTable(1, &baseColorSrvTable, D3D12_SHADER_VISIBILITY_PIXEL);
 	rootParameters[4].InitAsDescriptorTable(1, &normalSrvTable, D3D12_SHADER_VISIBILITY_PIXEL);
 	rootParameters[5].InitAsDescriptorTable(1, &roughnessSrvTable, D3D12_SHADER_VISIBILITY_PIXEL);
 	rootParameters[6].InitAsDescriptorTable(1, &metallicSrvTable, D3D12_SHADER_VISIBILITY_PIXEL);
 	rootParameters[7].InitAsDescriptorTable(1, &envSrvTable, D3D12_SHADER_VISIBILITY_PIXEL);
+	rootParameters[8].InitAsDescriptorTable(1, &shadowMapSrvTable, D3D12_SHADER_VISIBILITY_PIXEL);
 
 	auto staticSamplers = GetStaticSamplers();
 	CD3DX12_ROOT_SIGNATURE_DESC rootSignatureDesc(
@@ -336,6 +349,9 @@ void ShapesApp::BuildByteCodeAndInputLayout()
 {
 	vsBytecode = CompileShader(L"Shaders\\Color.hlsl", nullptr, "VS", "vs_5_0");
 	psBytecode = CompileShader(L"Shaders\\Color.hlsl", nullptr, "PS", "ps_5_0");
+	shaders["shadowMapVS"] = CompileShader(L"Shaders\\ShadowMap.hlsl", nullptr, "VS", "vs_5_0");
+	shaders["skyVS"] = CompileShader(L"Shaders\\Sky.hlsl", nullptr, "VS", "vs_5_0");
+	shaders["skyPS"] = CompileShader(L"Shaders\\Sky.hlsl", nullptr, "PS", "ps_5_0");
 
 	inputLayoutDesc1 =
 	{
@@ -354,6 +370,55 @@ void ShapesApp::BuildByteCodeAndInputLayout()
 		{ "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
 		{ "SIZE", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
 	};
+}
+
+void ShapesApp::BuildShadowMapResources()
+{
+	mShadowMapSrvHeapIndex = mNextSrvHeapIndex++;
+
+	D3D12_DESCRIPTOR_HEAP_DESC dsvHeapDesc = {};
+	dsvHeapDesc.NumDescriptors = 1;
+	dsvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+	dsvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+	dsvHeapDesc.NodeMask = 0;
+	ThrowIfFailed(md3dDevice->CreateDescriptorHeap(&dsvHeapDesc, IID_PPV_ARGS(&mShadowMapDsvHeap)));
+
+	D3D12_RESOURCE_DESC shadowMapDesc = {};
+	shadowMapDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+	shadowMapDesc.Alignment = 0;
+	shadowMapDesc.Width = ShadowMapSize;
+	shadowMapDesc.Height = ShadowMapSize;
+	shadowMapDesc.DepthOrArraySize = 1;
+	shadowMapDesc.MipLevels = 1;
+	shadowMapDesc.Format = DXGI_FORMAT_R32_TYPELESS;
+	shadowMapDesc.SampleDesc.Count = 1;
+	shadowMapDesc.SampleDesc.Quality = 0;
+	shadowMapDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+	shadowMapDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+
+	D3D12_CLEAR_VALUE clearValue = {};
+	clearValue.Format = DXGI_FORMAT_D32_FLOAT;
+	clearValue.DepthStencil.Depth = 1.0f;
+	clearValue.DepthStencil.Stencil = 0;
+
+	auto heapProperties = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+	ThrowIfFailed(md3dDevice->CreateCommittedResource(
+		&heapProperties,
+		D3D12_HEAP_FLAG_NONE,
+		&shadowMapDesc,
+		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+		&clearValue,
+		IID_PPV_ARGS(&mShadowMap)));
+
+	D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc = {};
+	dsvDesc.Flags = D3D12_DSV_FLAG_NONE;
+	dsvDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+	dsvDesc.Format = DXGI_FORMAT_D32_FLOAT;
+	dsvDesc.Texture2D.MipSlice = 0;
+	md3dDevice->CreateDepthStencilView(
+		mShadowMap.Get(),
+		&dsvDesc,
+		mShadowMapDsvHeap->GetCPUDescriptorHandleForHeapStart());
 }
 
 void ShapesApp::BuildShaderResourceView()
@@ -393,6 +458,23 @@ void ShapesApp::BuildShaderResourceView()
 			mCbvSrvUavDescriptorSize);
 		md3dDevice->CreateShaderResourceView(texture->resource.Get(), &srvDesc, handle);
 	}
+
+	if (mShadowMap != nullptr && mShadowMapSrvHeapIndex != std::numeric_limits<UINT>::max())
+	{
+		D3D12_SHADER_RESOURCE_VIEW_DESC shadowSrvDesc = {};
+		shadowSrvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		shadowSrvDesc.Format = DXGI_FORMAT_R32_FLOAT;
+		shadowSrvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+		shadowSrvDesc.Texture2D.MostDetailedMip = 0;
+		shadowSrvDesc.Texture2D.MipLevels = 1;
+		shadowSrvDesc.Texture2D.ResourceMinLODClamp = 0.0f;
+
+		CD3DX12_CPU_DESCRIPTOR_HANDLE handle(
+			mSrvHeap->GetCPUDescriptorHandleForHeapStart(),
+			mShadowMapSrvHeapIndex,
+			mCbvSrvUavDescriptorSize);
+		md3dDevice->CreateShaderResourceView(mShadowMap.Get(), &shadowSrvDesc, handle);
+	}
 }
 
 void ShapesApp::BuildPSO()
@@ -415,78 +497,27 @@ void ShapesApp::BuildPSO()
 
 	ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&mPSOs["opaque"])));
 
-	CD3DX12_BLEND_DESC mirrorBlendState(D3D12_DEFAULT);
-	mirrorBlendState.RenderTarget[0].RenderTargetWriteMask = 0;
+	D3D12_GRAPHICS_PIPELINE_STATE_DESC shadowMapPsoDesc = psoDesc;
+	shadowMapPsoDesc.VS = { reinterpret_cast<BYTE*>(shaders["shadowMapVS"]->GetBufferPointer()), shaders["shadowMapVS"]->GetBufferSize() };
+	shadowMapPsoDesc.PS = { nullptr, 0 };
+	shadowMapPsoDesc.RasterizerState.DepthBias = 100000;
+	shadowMapPsoDesc.RasterizerState.SlopeScaledDepthBias = 1.0f;
+	shadowMapPsoDesc.RasterizerState.DepthBiasClamp = 0.0f;
+	shadowMapPsoDesc.NumRenderTargets = 0;
+	for (auto& rtvFormat : shadowMapPsoDesc.RTVFormats)
+	{
+		rtvFormat = DXGI_FORMAT_UNKNOWN;
+	}
+	shadowMapPsoDesc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+	ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&shadowMapPsoDesc, IID_PPV_ARGS(&mPSOs["shadowMap"])));
 
-	D3D12_DEPTH_STENCIL_DESC mirrorDSS = {};
-	mirrorDSS.DepthEnable = true;
-	mirrorDSS.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
-	mirrorDSS.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
-	mirrorDSS.StencilEnable = true;
-	mirrorDSS.StencilReadMask = 0xff;
-	mirrorDSS.StencilWriteMask = 0xff;
-	mirrorDSS.FrontFace.StencilFailOp = D3D12_STENCIL_OP_KEEP;
-	mirrorDSS.FrontFace.StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
-	mirrorDSS.FrontFace.StencilPassOp = D3D12_STENCIL_OP_REPLACE;
-	mirrorDSS.FrontFace.StencilFunc = D3D12_COMPARISON_FUNC_ALWAYS;
-	mirrorDSS.BackFace = mirrorDSS.FrontFace;
-
-	D3D12_GRAPHICS_PIPELINE_STATE_DESC markMirrorPsoDesc = psoDesc;
-	markMirrorPsoDesc.BlendState = mirrorBlendState;
-	markMirrorPsoDesc.DepthStencilState = mirrorDSS;
-	ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&markMirrorPsoDesc, IID_PPV_ARGS(&mPSOs["markStencilMirror"])));
-
-	D3D12_DEPTH_STENCIL_DESC reflectionDSS = {};
-	reflectionDSS.DepthEnable = true;
-	reflectionDSS.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-	reflectionDSS.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
-	reflectionDSS.StencilEnable = true;
-	reflectionDSS.StencilReadMask = 0xff;
-	reflectionDSS.StencilWriteMask = 0xff;
-	reflectionDSS.FrontFace.StencilFailOp = D3D12_STENCIL_OP_KEEP;
-	reflectionDSS.FrontFace.StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
-	reflectionDSS.FrontFace.StencilPassOp = D3D12_STENCIL_OP_KEEP;
-	reflectionDSS.FrontFace.StencilFunc = D3D12_COMPARISON_FUNC_EQUAL;
-	reflectionDSS.BackFace = reflectionDSS.FrontFace;
-
-	D3D12_GRAPHICS_PIPELINE_STATE_DESC reflectionPsoDesc = psoDesc;
-	reflectionPsoDesc.DepthStencilState = reflectionDSS;
-	reflectionPsoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
-	reflectionPsoDesc.RasterizerState.FrontCounterClockwise = true;
-	ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&reflectionPsoDesc, IID_PPV_ARGS(&mPSOs["drawStencilReflections"])));
-
-	D3D12_RENDER_TARGET_BLEND_DESC transparentBlendState = {};
-	transparentBlendState.BlendEnable = true;
-	transparentBlendState.LogicOpEnable = false;
-	transparentBlendState.SrcBlend = D3D12_BLEND_SRC_ALPHA;
-	transparentBlendState.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
-	transparentBlendState.BlendOp = D3D12_BLEND_OP_ADD;
-	transparentBlendState.SrcBlendAlpha = D3D12_BLEND_ONE;
-	transparentBlendState.DestBlendAlpha = D3D12_BLEND_ZERO;
-	transparentBlendState.BlendOpAlpha = D3D12_BLEND_OP_ADD;
-	transparentBlendState.LogicOp = D3D12_LOGIC_OP_NOOP;
-	transparentBlendState.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-
-	D3D12_GRAPHICS_PIPELINE_STATE_DESC transparentPsoDesc = psoDesc;
-	transparentPsoDesc.BlendState.RenderTarget[0] = transparentBlendState;
-	ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&transparentPsoDesc, IID_PPV_ARGS(&mPSOs["transparent"])));
-
-	D3D12_DEPTH_STENCIL_DESC shadowDSS = {};
-	shadowDSS.DepthEnable = true;
-	shadowDSS.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-	shadowDSS.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
-	shadowDSS.StencilEnable = true;
-	shadowDSS.StencilReadMask = 0xff;
-	shadowDSS.StencilWriteMask = 0xff;
-	shadowDSS.FrontFace.StencilFailOp = D3D12_STENCIL_OP_KEEP;
-	shadowDSS.FrontFace.StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
-	shadowDSS.FrontFace.StencilPassOp = D3D12_STENCIL_OP_INCR;
-	shadowDSS.FrontFace.StencilFunc = D3D12_COMPARISON_FUNC_EQUAL;
-	shadowDSS.BackFace = shadowDSS.FrontFace;
-
-	D3D12_GRAPHICS_PIPELINE_STATE_DESC shadowPsoDesc = transparentPsoDesc;
-	shadowPsoDesc.DepthStencilState = shadowDSS;
-	ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&shadowPsoDesc, IID_PPV_ARGS(&mPSOs["shadow"])));
+	D3D12_GRAPHICS_PIPELINE_STATE_DESC skyPsoDesc = psoDesc;
+	skyPsoDesc.VS = { reinterpret_cast<BYTE*>(shaders["skyVS"]->GetBufferPointer()), shaders["skyVS"]->GetBufferSize() };
+	skyPsoDesc.PS = { reinterpret_cast<BYTE*>(shaders["skyPS"]->GetBufferPointer()), shaders["skyPS"]->GetBufferSize() };
+	skyPsoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+	skyPsoDesc.DepthStencilState.DepthEnable = false;
+	skyPsoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+	ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&skyPsoDesc, IID_PPV_ARGS(&mPSOs["sky"])));
 
 	D3D12_GRAPHICS_PIPELINE_STATE_DESC treeBillboardPsoDesc = psoDesc;
 	treeBillboardPsoDesc.InputLayout = { treeBillboardInputLayoutDesc.data(), static_cast<UINT>(treeBillboardInputLayoutDesc.size()) };
@@ -778,7 +809,11 @@ void ShapesApp::LoadTextures()
 	LoadTextureAsset("tileTex", L"Textures/tile.dds", true);
 	LoadTextureAsset("tileNormalTex", L"Textures/tile_nmap.dds", false);
 	LoadTextureAsset("treeArray2Tex", L"Textures/treearray.dds", true);
-	LoadTextureAsset("sunsetCubeTex", L"Textures/sunsetcube1024.dds", true);
+	LoadTextureAsset("suburbanGardenHdrTex", L"D:/Computer Graphics/PathTracer/PathTracer-CPP/images/HDR/suburban_garden_2k.hdr", false);
+	LoadTextureAsset("metal1BaseColorTex", L"D:/Computer Graphics/PathTracer/PathTracer-CPP/images/Metal1/Metal049A_2K-JPG_Color.jpg", true);
+	LoadTextureAsset("metal1NormalTex", L"D:/Computer Graphics/PathTracer/PathTracer-CPP/images/Metal1/Metal049A_2K-JPG_NormalDX.jpg", false);
+	LoadTextureAsset("metal1RoughnessTex", L"D:/Computer Graphics/PathTracer/PathTracer-CPP/images/Metal1/Metal049A_2K-JPG_Roughness.jpg", false);
+	LoadTextureAsset("metal1MetallicTex", L"D:/Computer Graphics/PathTracer/PathTracer-CPP/images/Metal1/Metal049A_2K-JPG_Metalness.jpg", false);
 }
 
 void ShapesApp::BuildMaterial()
@@ -792,20 +827,23 @@ void ShapesApp::BuildMaterial()
 		float roughnessFactor,
 		float metallicFactor,
 		float normalMapFlipY = 0.0f,
-		float alphaCutoff = 0.1f)
+		float alphaCutoff = 0.1f,
+		const std::string& roughnessTexture = "white1x1Tex",
+		const std::string& metallicTexture = "white1x1Tex",
+		float normalScale = 1.0f)
 	{
 		auto material = std::make_unique<Material>();
 		material->name = materialName;
 		material->matCBIndex = static_cast<int>(materials.size());
 		material->baseColorSrvHeapIndex = textures[baseColorTexture]->srvHeapIndex;
 		material->normalSrvHeapIndex = textures[normalTexture]->srvHeapIndex;
-		material->roughnessSrvHeapIndex = textures["white1x1Tex"]->srvHeapIndex;
-		material->metallicSrvHeapIndex = textures["white1x1Tex"]->srvHeapIndex;
+		material->roughnessSrvHeapIndex = textures[roughnessTexture]->srvHeapIndex;
+		material->metallicSrvHeapIndex = textures[metallicTexture]->srvHeapIndex;
 		material->baseColorFactor = baseColorFactor;
 		material->fresnelR0 = dielectricF0;
 		material->roughnessFactor = roughnessFactor;
 		material->metallicFactor = metallicFactor;
-		material->normalScale = 1.0f;
+		material->normalScale = normalScale;
 		material->normalMapFlipY = normalMapFlipY;
 		material->alphaCutoff = alphaCutoff;
 		materials[materialName] = std::move(material);
@@ -820,6 +858,20 @@ void ShapesApp::BuildMaterial()
 	addMaterial("mirror", "white1x1Tex", "defaultNormalTex", { 1.0f, 1.0f, 1.0f, 0.25f }, { 0.04f, 0.04f, 0.04f }, 0.05f, 1.0f);
 	addMaterial("shadow", "white1x1Tex", "defaultNormalTex", { 0.0f, 0.0f, 0.0f, 0.25f }, { 0.0f, 0.0f, 0.0f }, 1.0f, 0.0f);
 	addMaterial("treeBillboard", "treeArray2Tex", "defaultNormalTex", { 1.0f, 1.0f, 1.0f, 1.0f }, { 0.04f, 0.04f, 0.04f }, 0.85f, 0.0f, 0.0f, 0.1f);
+	addMaterial(
+		"pbrMetalSphere",
+		"metal1BaseColorTex",
+		"metal1NormalTex",
+		{ 1.0f, 1.0f, 1.0f, 1.0f },
+		{ 0.04f, 0.04f, 0.04f },
+		1.0f,
+		1.0f,
+		0.0f,
+		0.1f,
+		"metal1RoughnessTex",
+		"metal1MetallicTex",
+		1.0f);
+	addMaterial("pbrFloor", "tileTex", "tileNormalTex", { 0.82f, 0.84f, 0.82f, 1.0f }, { 0.04f, 0.04f, 0.04f }, 0.95f, 0.0f);
 }
 
 void ShapesApp::BuildImportedPbrSphere()
@@ -1073,189 +1125,46 @@ void ShapesApp::BuildRenderItems()
 		layer.clear();
 	}
 	mAllItem.clear();
-	mShadowPairs.clear();
 
-	UINT objCBIndex = 0;
-
-	auto addMergedGeometryItem = [&](const std::string& drawKey, const std::string& materialKey, CXMMATRIX worldMatrix)
+	UINT nextObjCBIndex = 0;
+	auto addTestItem = [&](const std::string& drawKey, const std::string& materialKey, CXMMATRIX worldMatrix)
 	{
 		auto renderItem = std::make_unique<RenderItem>();
 		XMStoreFloat4x4(&renderItem->world, worldMatrix);
-		renderItem->mObjCBIndex = objCBIndex++;
+		renderItem->mObjCBIndex = nextObjCBIndex++;
 		renderItem->mPrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 		renderItem->indexCount = mDrawArgs[drawKey].indexCount;
 		renderItem->baseVertexLocation = mDrawArgs[drawKey].baseVertexLocation;
 		renderItem->startIndexLocation = mDrawArgs[drawKey].startIndexLocation;
 		renderItem->mat = materials[materialKey].get();
+		renderItem->layer = RenderLayer::Opaque;
 		mAllItem.push_back(std::move(renderItem));
 	};
 
-	addMergedGeometryItem("box", "box", XMMatrixScaling(2.0f, 2.0f, 2.0f) * XMMatrixTranslation(0.0f, 0.5f, 0.0f));
-	addMergedGeometryItem("grid", "grid", XMMatrixScaling(3.0f, 3.0f, 3.0f));
-
-	for (int i = 0; i < 5; ++i)
-	{
-		const XMMATRIX leftCylinderWorld = XMMatrixTranslation(-5.0f, 1.5f, -10.0f + i * 5.0f);
-		const XMMATRIX rightCylinderWorld = XMMatrixTranslation(5.0f, 1.5f, -10.0f + i * 5.0f);
-		const XMMATRIX leftSphereWorld = XMMatrixTranslation(-5.0f, 3.5f, -10.0f + i * 5.0f);
-		const XMMATRIX rightSphereWorld = XMMatrixTranslation(5.0f, 3.5f, -10.0f + i * 5.0f);
-
-		addMergedGeometryItem("cylinder", "cylinder", leftCylinderWorld);
-		addMergedGeometryItem("cylinder", "cylinder", rightCylinderWorld);
-		addMergedGeometryItem("sphere", "sphere", leftSphereWorld);
-		addMergedGeometryItem("sphere", "sphere", rightSphereWorld);
-	}
-
-	if (auto it = geometries.find("skullGeo"); it != geometries.end())
-	{
-		auto renderItem = std::make_unique<RenderItem>();
-		XMStoreFloat4x4(&renderItem->world, XMMatrixScaling(0.4f, 0.4f, 0.4f) * XMMatrixTranslation(0.0f, 1.0f, 0.0f));
-		renderItem->mObjCBIndex = objCBIndex++;
-		renderItem->mPrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-		renderItem->geo = it->second.get();
-		const auto& submesh = it->second->mDrawArgs["skull"];
-		renderItem->indexCount = submesh.indexCount;
-		renderItem->baseVertexLocation = submesh.baseVertexLocation;
-		renderItem->startIndexLocation = submesh.startIndexLocation;
-		renderItem->mat = materials["skull"].get();
-		skullRitem = renderItem.get();
-		mAllItem.push_back(std::move(renderItem));
-	}
-
-	if (auto it = geometries.find("boxGeo"); it != geometries.end())
-	{
-		auto renderItem = std::make_unique<RenderItem>();
-		XMStoreFloat4x4(&renderItem->world, XMMatrixScaling(0.3f, 0.3f, 0.3f) * XMMatrixTranslation(0.0f, 1.0f, -5.0f));
-		renderItem->mObjCBIndex = objCBIndex++;
-		renderItem->mPrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-		renderItem->geo = it->second.get();
-		const auto& submesh = it->second->mDrawArgs["woodBox"];
-		renderItem->indexCount = submesh.indexCount;
-		renderItem->baseVertexLocation = submesh.baseVertexLocation;
-		renderItem->startIndexLocation = submesh.startIndexLocation;
-		renderItem->mat = materials["wood"].get();
-		mAllItem.push_back(std::move(renderItem));
-	}
-
-	if (auto it = geometries.find("ornamentGeo"); it != geometries.end())
-	{
-		for (const auto& [materialKey, submesh] : it->second->mDrawArgs)
-		{
-			auto renderItem = std::make_unique<RenderItem>();
-			const XMMATRIX ornamentWorld =
-				XMMatrixScaling(1.2f, 1.2f, 1.2f) *
-				XMMatrixRotationY(0.25f * XM_PI) *
-				XMMatrixTranslation(1.5f, 1.45f, -1.6f);
-			XMStoreFloat4x4(&renderItem->world, ornamentWorld);
-			renderItem->mObjCBIndex = objCBIndex++;
-			renderItem->mPrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-			renderItem->geo = it->second.get();
-			renderItem->indexCount = submesh.indexCount;
-			renderItem->baseVertexLocation = submesh.baseVertexLocation;
-			renderItem->startIndexLocation = submesh.startIndexLocation;
-			renderItem->mat = materials[materialKey].get();
-			mAllItem.push_back(std::move(renderItem));
-		}
-	}
-
-	RenderItem* mirrorItem = nullptr;
-	if (auto it = geometries.find("gridGeo"); it != geometries.end())
-	{
-		auto renderItem = std::make_unique<RenderItem>();
-		XMStoreFloat4x4(&renderItem->world, XMMatrixScaling(0.6f, 0.6f, 0.6f) * XMMatrixRotationX(-1.5f) * XMMatrixTranslation(0.0f, 3.0f, 4.0f));
-		renderItem->mObjCBIndex = objCBIndex++;
-		renderItem->mPrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-		renderItem->geo = it->second.get();
-		const auto& submesh = it->second->mDrawArgs["mirrorGrid"];
-		renderItem->indexCount = submesh.indexCount;
-		renderItem->baseVertexLocation = submesh.baseVertexLocation;
-		renderItem->startIndexLocation = submesh.startIndexLocation;
-		renderItem->mat = materials["mirror"].get();
-		renderItem->layer = RenderLayer::Mirrors;
-		mirrorItem = renderItem.get();
-		mAllItem.push_back(std::move(renderItem));
-	}
-
-	if (skullRitem != nullptr)
-	{
-		if (auto it = geometries.find("skullGeo"); it != geometries.end())
-		{
-			auto renderItem = std::make_unique<RenderItem>();
-			XMVECTOR mirrorPlane = XMVectorSet(0.0f, 0.0f, 1.0f, -4.0f);
-			XMMATRIX reflectionMatrix = XMMatrixReflect(mirrorPlane);
-			XMMATRIX skullWorld = XMLoadFloat4x4(&skullRitem->world);
-			XMStoreFloat4x4(&renderItem->world, skullWorld * reflectionMatrix);
-			renderItem->mObjCBIndex = objCBIndex++;
-			renderItem->mPrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-			renderItem->geo = it->second.get();
-			const auto& submesh = it->second->mDrawArgs["skull"];
-			renderItem->indexCount = submesh.indexCount;
-			renderItem->baseVertexLocation = submesh.baseVertexLocation;
-			renderItem->startIndexLocation = submesh.startIndexLocation;
-			renderItem->mat = materials["skull"].get();
-			renderItem->layer = RenderLayer::Reflect;
-			skullMirrorItem = renderItem.get();
-			mAllItem.push_back(std::move(renderItem));
-		}
-	}
-
-	if (auto it = geometries.find("treeBillboardGeo"); it != geometries.end())
+	auto addSkyItem = [&]()
 	{
 		auto renderItem = std::make_unique<RenderItem>();
 		renderItem->world = MathHelper::Identity4x4();
-		renderItem->mObjCBIndex = objCBIndex++;
-		renderItem->mPrimitiveType = D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
-		renderItem->geo = it->second.get();
-		const auto& submesh = it->second->mDrawArgs["treeBillboard"];
-		renderItem->indexCount = submesh.indexCount;
-		renderItem->baseVertexLocation = submesh.baseVertexLocation;
-		renderItem->startIndexLocation = submesh.startIndexLocation;
-		renderItem->mat = materials["treeBillboard"].get();
-		renderItem->layer = RenderLayer::AlphaTest;
+		renderItem->mObjCBIndex = nextObjCBIndex++;
+		renderItem->mPrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+		renderItem->indexCount = mDrawArgs["sphere"].indexCount;
+		renderItem->baseVertexLocation = mDrawArgs["sphere"].baseVertexLocation;
+		renderItem->startIndexLocation = mDrawArgs["sphere"].startIndexLocation;
+		renderItem->layer = RenderLayer::Sky;
 		mAllItem.push_back(std::move(renderItem));
-	}
+	};
+
+	addSkyItem();
+	addTestItem("grid", "pbrFloor", XMMatrixIdentity());
+	addTestItem("sphere", "pbrMetalSphere", XMMatrixScaling(2.0f, 2.0f, 2.0f) * XMMatrixTranslation(0.0f, 1.0f, 0.0f));
 
 	for (auto& renderItem : mAllItem)
 	{
 		mRitemLayer[(int)renderItem->layer].push_back(renderItem.get());
 	}
 
-	for (RenderItem* opaqueItem : mRitemLayer[(int)RenderLayer::Opaque])
-	{
-		if (opaqueItem->mat == nullptr)
-		{
-			continue;
-		}
-
-		const bool castsPlanarShadow =
-			opaqueItem == skullRitem ||
-			(opaqueItem->geo != nullptr && opaqueItem->geo->name == "ornamentGeo");
-
-		if (!castsPlanarShadow)
-		{
-			continue;
-		}
-
-		auto shadowItem = std::make_unique<RenderItem>(*opaqueItem);
-		shadowItem->mObjCBIndex = objCBIndex++;
-		shadowItem->layer = RenderLayer::Shadow;
-		shadowItem->mat = materials["shadow"].get();
-
-		if (opaqueItem == skullRitem)
-		{
-			skullShadowItem = shadowItem.get();
-		}
-
-		RenderItem* shadowPtr = shadowItem.get();
-		mRitemLayer[(int)RenderLayer::Shadow].push_back(shadowPtr);
-		mShadowPairs.push_back({ opaqueItem, shadowPtr });
-		mAllItem.push_back(std::move(shadowItem));
-	}
-
-	if (mirrorItem != nullptr)
-	{
-		mRitemLayer[(int)RenderLayer::Transparent].push_back(mirrorItem);
-	}
+	mSceneBoundsCenter = XMFLOAT3(0.0f, 1.0f, 0.0f);
+	mSceneBoundsRadius = 18.0f;
 }
 
 void ShapesApp::BuildFrameResource()
@@ -1267,7 +1176,7 @@ void ShapesApp::BuildFrameResource()
 			md3dDevice.Get(),
 			static_cast<UINT>(mAllItem.size()),
 			static_cast<UINT>(materials.size()),
-			2));
+			1));
 	}
 
 	mCurrentFrameResourcesIndex = 0;
@@ -1349,25 +1258,40 @@ void ShapesApp::UpdatePassCBs(const GameTimer& gt)
 	const XMVECTOR fillLightDir = XMVector3Normalize(XMVectorSet(0.35f, -0.75f, 0.45f, 0.0f));
 	XMStoreFloat3(&passConstants.lights[1].direction, fillLightDir);
 
+	UpdateShadowTransform();
 	mCurrentFrameResources->passCB->CopyData(0, passConstants);
-	UpdateReflectPassCBs();
 }
 
-void ShapesApp::UpdateReflectPassCBs()
+void ShapesApp::UpdateShadowTransform()
 {
-	reflectPassConstant = passConstants;
+	const XMVECTOR sceneCenter = XMLoadFloat3(&mSceneBoundsCenter);
+	const XMVECTOR lightDir = XMVector3Normalize(XMLoadFloat3(&passConstants.lights[0].direction));
+	const XMVECTOR lightPos = sceneCenter - 2.0f * mSceneBoundsRadius * lightDir;
+	const XMVECTOR up = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
 
-	const XMVECTOR mirrorPlane = XMVectorSet(0.0f, 0.0f, 1.0f, -4.0f);
-	const XMMATRIX reflectionMatrix = XMMatrixReflect(mirrorPlane);
+	const XMMATRIX lightView = XMMatrixLookAtLH(lightPos, sceneCenter, up);
 
-	for (int i = 0; i < 2; ++i)
-	{
-		const XMVECTOR lightDir = XMLoadFloat3(&passConstants.lights[i].direction);
-		const XMVECTOR reflectedLightDir = XMVector3TransformNormal(lightDir, reflectionMatrix);
-		XMStoreFloat3(&reflectPassConstant.lights[i].direction, reflectedLightDir);
-	}
+	XMFLOAT3 centerLightSpace;
+	XMStoreFloat3(&centerLightSpace, XMVector3TransformCoord(sceneCenter, lightView));
 
-	mCurrentFrameResources->passCB->CopyData(1, reflectPassConstant);
+	const float l = centerLightSpace.x - mSceneBoundsRadius;
+	const float r = centerLightSpace.x + mSceneBoundsRadius;
+	const float b = centerLightSpace.y - mSceneBoundsRadius;
+	const float t = centerLightSpace.y + mSceneBoundsRadius;
+	const float n = centerLightSpace.z - mSceneBoundsRadius;
+	const float f = centerLightSpace.z + mSceneBoundsRadius;
+	const XMMATRIX lightProj = XMMatrixOrthographicOffCenterLH(l, r, b, t, n, f);
+
+	const XMMATRIX textureTransform(
+		0.5f, 0.0f, 0.0f, 0.0f,
+		0.0f, -0.5f, 0.0f, 0.0f,
+		0.0f, 0.0f, 1.0f, 0.0f,
+		0.5f, 0.5f, 0.0f, 1.0f);
+
+	const XMMATRIX lightViewProj = lightView * lightProj;
+	const XMMATRIX shadowTransform = lightViewProj * textureTransform;
+	XMStoreFloat4x4(&passConstants.LightViewProj, XMMatrixTranspose(lightViewProj));
+	XMStoreFloat4x4(&passConstants.ShadowTransform, XMMatrixTranspose(shadowTransform));
 }
 
 void ShapesApp::UpdateMatCBs()
@@ -1403,44 +1327,9 @@ void ShapesApp::OnKeyboardInput(const GameTimer& gt)
 	if (GetAsyncKeyState(VK_UP) & 0x8000) sunPhi -= 1.0f * dt;
 	if (GetAsyncKeyState(VK_DOWN) & 0x8000) sunPhi += 1.0f * dt;
 	sunPhi = MathHelper::Clamp(sunPhi, 0.1f, XM_PIDIV2);
-
-	if (GetAsyncKeyState('A') & 0x8000) skullTranslation.x -= 2.0f * dt;
-	if (GetAsyncKeyState('D') & 0x8000) skullTranslation.x += 2.0f * dt;
-	if (GetAsyncKeyState('W') & 0x8000) skullTranslation.y += 2.0f * dt;
-	if (GetAsyncKeyState('S') & 0x8000) skullTranslation.y -= 2.0f * dt;
-	skullTranslation.y = MathHelper::Max(0.0f, skullTranslation.y);
-
-	if (skullRitem != nullptr)
-	{
-		const XMMATRIX skullScale = XMMatrixScaling(0.4f, 0.4f, 0.4f);
-		const XMMATRIX skullTranslate = XMMatrixTranslation(skullTranslation.x, skullTranslation.y + 1.0f, skullTranslation.z);
-		const XMMATRIX skullWorld = skullScale * skullTranslate;
-		XMStoreFloat4x4(&skullRitem->world, skullWorld);
-		skullRitem->numFramesDirty = mFrameResourcesCount;
-
-		if (skullMirrorItem != nullptr)
-		{
-			const XMVECTOR mirrorPlane = XMVectorSet(0.0f, 0.0f, 1.0f, -4.0f);
-			const XMMATRIX reflectionMatrix = XMMatrixReflect(mirrorPlane);
-			XMStoreFloat4x4(&skullMirrorItem->world, skullWorld * reflectionMatrix);
-			skullMirrorItem->numFramesDirty = mFrameResourcesCount;
-		}
-	}
-
-	const XMVECTOR shadowPlane = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
-	const XMVECTOR toMainLight = MathHelper::SphericalToCartesian(1.0f, sunTheta, sunPhi);
-	const XMMATRIX shadowMatrix = XMMatrixShadow(shadowPlane, toMainLight);
-	const XMMATRIX shadowOffset = XMMatrixTranslation(0.0f, 0.001f, 0.0f);
-
-	for (auto& [sourceItem, shadowItem] : mShadowPairs)
-	{
-		const XMMATRIX sourceWorld = XMLoadFloat4x4(&sourceItem->world);
-		XMStoreFloat4x4(&shadowItem->world, sourceWorld * shadowMatrix * shadowOffset);
-		shadowItem->numFramesDirty = mFrameResourcesCount;
-	}
 }
 
-std::array<CD3DX12_STATIC_SAMPLER_DESC, 7> ShapesApp::GetStaticSamplers()
+std::array<CD3DX12_STATIC_SAMPLER_DESC, 8> ShapesApp::GetStaticSamplers()
 {
 	const CD3DX12_STATIC_SAMPLER_DESC pointWrap(
 		0,
@@ -1497,7 +1386,18 @@ std::array<CD3DX12_STATIC_SAMPLER_DESC, 7> ShapesApp::GetStaticSamplers()
 		0.0f,
 		8);
 
-	return { pointWrap, pointClamp, linearWrap, linearClamp, anisotropicWrap, anisotropicClamp, anisotropicMirror };
+	const CD3DX12_STATIC_SAMPLER_DESC shadow(
+		7,
+		D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT,
+		D3D12_TEXTURE_ADDRESS_MODE_BORDER,
+		D3D12_TEXTURE_ADDRESS_MODE_BORDER,
+		D3D12_TEXTURE_ADDRESS_MODE_BORDER,
+		0.0f,
+		16,
+		D3D12_COMPARISON_FUNC_LESS_EQUAL,
+		D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE);
+
+	return { pointWrap, pointClamp, linearWrap, linearClamp, anisotropicWrap, anisotropicClamp, anisotropicMirror, shadow };
 }
 
 D3D12_VERTEX_BUFFER_VIEW ShapesApp::GetVBV() const

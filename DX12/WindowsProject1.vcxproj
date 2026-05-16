@@ -213,6 +213,16 @@
     </None>
   </ItemGroup>
   <ItemGroup>
+    <None Include="Shaders\ShadowMap.hlsl">
+      <FileType>Document</FileType>
+    </None>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="Shaders\Sky.hlsl">
+      <FileType>Document</FileType>
+    </None>
+  </ItemGroup>
+  <ItemGroup>
     <None Include="Shaders\TreeBillboard.hlsl">
       <FileType>Document</FileType>
     </None>

@@ -134,7 +134,8 @@ float3 ComputeLighting(Light lights[MAX_LIGHTS], Material mat, float3 posWS, flo
 #if (NUM_DIR_LIGHTS > 0)
     for (i = 0; i < NUM_DIR_LIGHTS; ++i)
     {
-        result += shadowFactor * ComputeDirectionalLight(lights[i], mat, normalWS, viewDirWS);
+        const float dirShadow = (i == 0) ? shadowFactor : 1.0f;
+        result += dirShadow * ComputeDirectionalLight(lights[i], mat, normalWS, viewDirWS);
     }
 #endif
 

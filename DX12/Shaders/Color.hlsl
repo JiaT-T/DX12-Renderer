@@ -32,6 +32,8 @@ cbuffer cbMaterial : register(b1)
 cbuffer cbPass : register(b2)
 {
     float4x4 gViewProj;
+    float4x4 gLightViewProj;
+    float4x4 gShadowTransform;
     float3 gCameraPosW;
     float gTotalTime;
     float4 gAmbientLight;
@@ -53,7 +55,8 @@ Texture2D gBaseColorMap : register(t0);
 Texture2D gNormalMap : register(t1);
 Texture2D gRoughnessMap : register(t2);
 Texture2D gMetallicMap : register(t3);
-TextureCube gEnvMap : register(t4);
+Texture2D gEnvMap : register(t4);
+Texture2D gShadowMap : register(t5);
 
 SamplerState samPointWarp         : register(s0);
 SamplerState samPointClamp        : register(s1);
@@ -62,6 +65,7 @@ SamplerState samLinearClamp       : register(s3);
 SamplerState samAnisotropicWarp   : register(s4);
 SamplerState samAnisotropicClamp  : register(s5);
 SamplerState samAnisotropicMirror : register(s6);
+SamplerComparisonState samShadow  : register(s7);
 
 struct VertexOut
 {
@@ -70,6 +74,7 @@ struct VertexOut
     float3 NormalWS : NORMAL;
     float4 TangentWS : TANGENT;
     float2 TexC : TEXCOORD;
+    float4 ShadowPosH : TEXCOORD1;
 };
 
 float3 SampleNormalWS(float3 baseNormalWS, float4 tangentWS, float2 texC)
@@ -106,6 +111,23 @@ float3 ToneMapACES(float3 color)
     return saturate((color * (a * color + b)) / (color * (c * color + d) + e));
 }
 
+float2 DirectionToEquirectUV(float3 dir)
+{
+    dir = normalize(dir);
+
+    const float invTwoPi = 0.15915494309f;
+    const float invPi = 0.31830988618f;
+
+    float u = atan2(dir.z, dir.x) * invTwoPi + 0.5f;
+    float v = acos(clamp(dir.y, -1.0f, 1.0f)) * invPi;
+    return float2(frac(u), saturate(v));
+}
+
+float3 SampleEnvironment(float3 dir, float mipLevel)
+{
+    return gEnvMap.SampleLevel(samLinearWarp, DirectionToEquirectUV(dir), mipLevel).rgb;
+}
+
 VertexOut VS(VertexIn v)
 {
     VertexOut o;
@@ -116,9 +138,46 @@ VertexOut VS(VertexIn v)
     o.TangentWS.xyz = mul(v.TangentU.xyz, (float3x3) gWorld);
     o.TangentWS.w = v.TangentU.w;
     o.PosHS = mul(posW, gViewProj);
+    o.ShadowPosH = mul(posW, gShadowTransform);
     o.TexC = v.TexC;
 
     return o;
+}
+
+float CalcShadowFactor(float4 shadowPosH)
+{
+    shadowPosH.xyz /= shadowPosH.w;
+
+    if (shadowPosH.x < 0.0f || shadowPosH.x > 1.0f ||
+        shadowPosH.y < 0.0f || shadowPosH.y > 1.0f ||
+        shadowPosH.z < 0.0f || shadowPosH.z > 1.0f)
+    {
+        return 1.0f;
+    }
+
+    uint width;
+    uint height;
+    uint mipCount;
+    gShadowMap.GetDimensions(0, width, height, mipCount);
+
+    const float dx = 1.0f / (float) width;
+    const float depth = shadowPosH.z - 0.0025f;
+    float percentLit = 0.0f;
+
+    [unroll]
+    for (int y = -1; y <= 1; ++y)
+    {
+        [unroll]
+        for (int x = -1; x <= 1; ++x)
+        {
+            percentLit += gShadowMap.SampleCmpLevelZero(
+                samShadow,
+                shadowPosH.xy + float2(x, y) * dx,
+                depth);
+        }
+    }
+
+    return percentLit / 9.0f;
 }
 
 float4 PS(VertexOut i) : SV_TARGET
@@ -139,7 +198,8 @@ float4 PS(VertexOut i) : SV_TARGET
     mat.roughness = roughness;
     mat.metallic = metallic;
 
-    float3 directLight = ComputeLighting(gLights, mat, i.PosWS, normalWS, viewDirWS, 1.0f);
+    float shadowFactor = CalcShadowFactor(i.ShadowPosH);
+    float3 directLight = ComputeLighting(gLights, mat, i.PosWS, normalWS, viewDirWS, shadowFactor);
 
     float NdotV = saturate(dot(normalWS, viewDirWS));
     float3 F0 = lerp(gFresnelR0, baseColor.rgb, metallic);
@@ -147,9 +207,9 @@ float4 PS(VertexOut i) : SV_TARGET
     float3 kD = (1.0f - kS) * (1.0f - metallic);
 
     float envMip = max(gEnvMapMipCount - 1.0f, 0.0f);
-    float3 diffuseEnv = gEnvMap.SampleLevel(samLinearClamp, normalWS, envMip).rgb;
+    float3 diffuseEnv = SampleEnvironment(normalWS, envMip);
     float3 reflectDir = reflect(-viewDirWS, normalWS);
-    float3 prefilteredEnv = gEnvMap.SampleLevel(samLinearClamp, reflectDir, roughness * envMip).rgb;
+    float3 prefilteredEnv = SampleEnvironment(reflectDir, roughness * envMip);
     float3 specularIBL = prefilteredEnv * EnvBRDFApprox(F0, roughness, NdotV);
     float3 diffuseIBL = diffuseEnv * baseColor.rgb * kD;
 

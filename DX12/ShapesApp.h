@@ -41,6 +41,7 @@ public:
 		Transparent,
 		AlphaTest,
 		Shadow,
+		Sky,
 		Count
 	};
 
@@ -93,10 +94,12 @@ public:
 
 	void Draw() override;
 	void DrawRenderItems(const std::vector<RenderItem*>& ritems);
+	void DrawSceneToShadowMap();
 	void OnResize() override;
 
 	void BuildRootSignature();
 	void BuildByteCodeAndInputLayout();
+	void BuildShadowMapResources();
 	void BuildShaderResourceView();
 	void BuildPSO();
 
@@ -115,8 +118,8 @@ public:
 	void Update(GameTimer& gt) override;
 	void UpdateObjCBs();
 	void UpdatePassCBs(const GameTimer& gt);
-	void UpdateReflectPassCBs();
 	void UpdateMatCBs();
+	void UpdateShadowTransform();
 
 	void OnKeyboardInput(const GameTimer& gt);
 	Texture* LoadTextureAsset(const std::string& textureName, const std::wstring& filename, bool sRGB);
@@ -124,7 +127,7 @@ public:
 
 	D3D12_VERTEX_BUFFER_VIEW GetVBV() const;
 	D3D12_INDEX_BUFFER_VIEW GetIBV() const;
-	std::array<CD3DX12_STATIC_SAMPLER_DESC, 7> GetStaticSamplers();
+	std::array<CD3DX12_STATIC_SAMPLER_DESC, 8> GetStaticSamplers();
 
 	bool InitRnederItems(HINSTANCE hInstance, int nShowCmd, std::wstring customCaption);
 
@@ -136,8 +139,9 @@ protected:
 	std::unordered_map<std::string, std::unique_ptr<Material>> materials;
 	std::unordered_map<std::string, std::unique_ptr<Texture>> textures;
 	std::vector<std::unique_ptr<RenderItem>> mAllItem;
-	std::string mEnvironmentTextureName = "sunsetCubeTex";
+	std::string mEnvironmentTextureName = "suburbanGardenHdrTex";
 	UINT mNextSrvHeapIndex = 0;
+	UINT mShadowMapSrvHeapIndex = std::numeric_limits<UINT>::max();
 
 	ComPtr<ID3D12RootSignature> mRootSignature = nullptr;
 
@@ -149,6 +153,8 @@ protected:
 	std::vector<D3D12_INPUT_ELEMENT_DESC> treeBillboardInputLayoutDesc;
 
 	ComPtr<ID3D12DescriptorHeap> mSrvHeap = nullptr;
+	ComPtr<ID3D12DescriptorHeap> mShadowMapDsvHeap = nullptr;
+	ComPtr<ID3D12Resource> mShadowMap = nullptr;
 	std::unordered_map<std::string, Microsoft::WRL::ComPtr<ID3D12PipelineState>> mPSOs;
 
 	UINT totalByteSize = 0;
@@ -167,12 +173,11 @@ protected:
 
 	std::vector<RenderItem*> mRitemLayer[(int)RenderLayer::Count];
 
-	RenderItem* skullRitem = nullptr;
-	RenderItem* skullMirrorItem = nullptr;
-	RenderItem* skullShadowItem = nullptr;
-
-	XMFLOAT3 skullTranslation = { 0.0f, 0.0f, 0.0f };
-	std::vector<std::pair<RenderItem*, RenderItem*>> mShadowPairs;
+	static constexpr UINT ShadowMapSize = 2048;
+	D3D12_VIEWPORT mShadowViewport = { 0.0f, 0.0f, static_cast<float>(ShadowMapSize), static_cast<float>(ShadowMapSize), 0.0f, 1.0f };
+	D3D12_RECT mShadowScissorRect = { 0, 0, static_cast<LONG>(ShadowMapSize), static_cast<LONG>(ShadowMapSize) };
+	XMFLOAT3 mSceneBoundsCenter = { 0.0f, 1.0f, 0.0f };
+	float mSceneBoundsRadius = 16.0f;
 
 protected:
 	XMFLOAT4X4 mProj = MathHelper::Identity4x4();
@@ -180,5 +185,4 @@ protected:
 	UINT mCurrentFrameResourcesIndex = 0;
 	FrameResources* mCurrentFrameResources = nullptr;
 	PassConstants passConstants;
-	PassConstants reflectPassConstant;
 };
