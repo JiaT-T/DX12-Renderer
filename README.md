@@ -2,6 +2,8 @@
 
 一个基于 DirectX 12 的实时渲染项目，当前实现重点围绕金属度-粗糙度 PBR、基于 split-sum approximation 的 IBL 预计算流程以及真实阴影映射展开。项目代码位于 [`DX12/`](./DX12) 目录。
 
+![Sponza preview](./README_Assets/sponza_preview.png)
+
 ## 当前特性
 
 - 基于 `DirectX 12 + Win32` 的基础渲染框架
@@ -37,14 +39,16 @@
   - `tinyobjloader`
   - `stb_image`
   - `DDSTextureLoader`
+  - OBJ / MTL 静态场景导入
 
 ## 当前场景
 
-当前运行场景用于验证 PBR、IBL 与 shadow map 的组合效果，包含：
+当前运行场景用于验证 PBR、IBL、shadow map 与复杂 OBJ 场景资产的组合效果，包含：
 
-- 一个平面
-- 一个金属球体
-- 一张 HDR 环境贴图背景
+- Sponza 静态场景模型
+- MTL 材质拆分后的多个子网格
+- base color / normal / roughness / metallic / alpha mask 贴图绑定
+- HDR 环境贴图背景
 
 当前使用的主要测试资源包括：
 
@@ -54,7 +58,7 @@
 - [`DX12/Shaders/PrefilterEnvMap.hlsl`](./DX12/Shaders/PrefilterEnvMap.hlsl)
 - [`DX12/Shaders/ShadowMap.hlsl`](./DX12/Shaders/ShadowMap.hlsl)
 - [`DX12/Shaders/Sky.hlsl`](./DX12/Shaders/Sky.hlsl)
-- `D:/Computer Graphics/PathTracer/PathTracer-CPP/images/Metal1`
+- `D:/Computer Graphics/PathTracer/PathTracer-CPP/Model/sponza`
 - `D:/Computer Graphics/PathTracer/PathTracer-CPP/images/HDR/suburban_garden_2k.hdr`
 
 ## 渲染流程

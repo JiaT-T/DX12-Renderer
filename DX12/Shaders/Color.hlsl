@@ -61,6 +61,7 @@ Texture2D gShadowMap : register(t5);
 Texture2D gBrdfLut : register(t6);
 TextureCube gPrefilteredEnvMap : register(t7);
 TextureCube gIrradianceMap : register(t8);
+Texture2D gAlphaMap : register(t9);
 
 SamplerState samPointWarp         : register(s0);
 SamplerState samPointClamp        : register(s1);
@@ -177,6 +178,7 @@ float CalcShadowFactor(float4 shadowPosH)
 float4 PS(VertexOut i) : SV_TARGET
 {
     float4 baseColor = gBaseColorMap.Sample(samAnisotropicWarp, i.TexC) * gBaseColorFactor;
+    baseColor.a *= gAlphaMap.Sample(samLinearClamp, i.TexC).r;
     clip(baseColor.a - gAlphaCutoff);
 
     float3 viewDirWS = normalize(gCameraPosW - i.PosWS);

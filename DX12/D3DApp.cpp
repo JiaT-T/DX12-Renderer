@@ -496,7 +496,7 @@ void D3DApp::OnMouseMove(WPARAM btnState, int x, int y)
 		float dy = 0.005f * static_cast<float>(y - mLastMousePos.y);
 
 		mRadius += dx + dy;
-		mRadius = MathHelper::Clamp(mRadius, 3.0f, 25.0f);
+		mRadius = MathHelper::Clamp(mRadius, 3.0f, 10000.0f);
 	}
 	mLastMousePos.x = x;						 //更新鼠标位置x分量
 	mLastMousePos.y = y;						 //更新鼠标位置y分量
