@@ -82,6 +82,7 @@ struct Material
 	int normalSrvHeapIndex = -1;
 	int roughnessSrvHeapIndex = -1;
 	int metallicSrvHeapIndex = -1;
+	int alphaSrvHeapIndex = -1;
 	int numFramesDirty = 3;
 
 	XMFLOAT4 baseColorFactor = { 1.0f, 1.0f, 1.0f, 1.0f };

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <filesystem>
 #include <map>
 
@@ -74,6 +75,135 @@ namespace
 		const float handedness = XMVectorGetX(XMVector3Dot(XMVector3Cross(normalV, tangentV), bitangentV)) < 0.0f ? -1.0f : 1.0f;
 		return XMFLOAT4(tangent3.x, tangent3.y, tangent3.z, handedness);
 	}
+
+	std::string SanitizeKey(const std::string& text)
+	{
+		std::string result;
+		result.reserve(text.size());
+		bool lastWasSeparator = false;
+
+		for (unsigned char ch : text)
+		{
+			if (std::isalnum(ch))
+			{
+				result.push_back(static_cast<char>(ch));
+				lastWasSeparator = false;
+			}
+			else if (!lastWasSeparator)
+			{
+				result.push_back('_');
+				lastWasSeparator = true;
+			}
+		}
+
+		while (!result.empty() && result.back() == '_')
+		{
+			result.pop_back();
+		}
+
+		return result.empty() ? "default" : result;
+	}
+
+	std::string ToLowerAscii(std::string text)
+	{
+		std::transform(text.begin(), text.end(), text.begin(), [](unsigned char ch)
+		{
+			return static_cast<char>(std::tolower(ch));
+		});
+		return text;
+	}
+
+	std::filesystem::path NormalizeObjTexturePath(const std::string& textureName)
+	{
+		std::string normalized = textureName;
+		std::replace(normalized.begin(), normalized.end(), '\\', '/');
+		return std::filesystem::path(normalized);
+	}
+
+	std::filesystem::path ResolveObjTexturePath(
+		const std::filesystem::path& objDirectory,
+		const std::string& textureName)
+	{
+		if (textureName.empty())
+		{
+			return {};
+		}
+
+		const std::filesystem::path rawPath = NormalizeObjTexturePath(textureName);
+		if (rawPath.is_absolute() && std::filesystem::exists(rawPath))
+		{
+			return rawPath;
+		}
+
+		const std::filesystem::path candidates[] =
+		{
+			objDirectory / rawPath,
+			objDirectory / rawPath.filename(),
+			objDirectory / "textures" / rawPath.filename(),
+			objDirectory.parent_path() / rawPath,
+			objDirectory.parent_path() / rawPath.filename(),
+			objDirectory.parent_path() / "textures" / rawPath.filename()
+		};
+
+		for (const auto& candidate : candidates)
+		{
+			if (std::filesystem::exists(candidate))
+			{
+				return candidate;
+			}
+		}
+
+		return objDirectory / rawPath;
+	}
+
+	bool ShouldFlipNormalY(const std::string& textureName)
+	{
+		const std::string lowered = ToLowerAscii(textureName);
+		return lowered.find("normalgl") != std::string::npos ||
+			lowered.find("normal_gl") != std::string::npos ||
+			lowered.find("opengl") != std::string::npos;
+	}
+
+	void ExpandBounds(ShapesApp::Bounds& bounds, const XMFLOAT3& position)
+	{
+		if (!bounds.valid)
+		{
+			bounds.min = position;
+			bounds.max = position;
+			bounds.valid = true;
+			return;
+		}
+
+		bounds.min.x = std::min(bounds.min.x, position.x);
+		bounds.min.y = std::min(bounds.min.y, position.y);
+		bounds.min.z = std::min(bounds.min.z, position.z);
+		bounds.max.x = std::max(bounds.max.x, position.x);
+		bounds.max.y = std::max(bounds.max.y, position.y);
+		bounds.max.z = std::max(bounds.max.z, position.z);
+	}
+
+	void FinalizeBounds(ShapesApp::Bounds& bounds, const std::vector<ShapesApp::Vertex1>& vertices)
+	{
+		if (!bounds.valid)
+		{
+			return;
+		}
+
+		bounds.center = XMFLOAT3(
+			0.5f * (bounds.min.x + bounds.max.x),
+			0.5f * (bounds.min.y + bounds.max.y),
+			0.5f * (bounds.min.z + bounds.max.z));
+
+		float radiusSq = 0.0f;
+		const XMVECTOR center = XMLoadFloat3(&bounds.center);
+		for (const auto& vertex : vertices)
+		{
+			const XMVECTOR p = XMLoadFloat3(&vertex.Pos);
+			const XMVECTOR d = p - center;
+			radiusSq = std::max(radiusSq, XMVectorGetX(XMVector3LengthSq(d)));
+		}
+		bounds.radius = std::sqrt(radiusSq);
+	}
 }
 
 ShapesApp::~ShapesApp()
@@ -104,6 +234,7 @@ bool ShapesApp::InitRnederItems(HINSTANCE hInstance, int nShowCmd, std::wstring 
 	BuildShapeGeometry();
 	LoadTextures();
 	BuildMaterial();
+	BuildStaticSceneModels();
 	BuildRenderItems();
 	BuildFrameResource();
 	BuildShadowMapResources();
@@ -280,6 +411,7 @@ void ShapesApp::DrawRenderItems(const std::vector<RenderItem*>& ritems)
 			mCommandList->SetGraphicsRootDescriptorTable(4, makeSrvHandle(ritem->mat->normalSrvHeapIndex));
 			mCommandList->SetGraphicsRootDescriptorTable(5, makeSrvHandle(ritem->mat->roughnessSrvHeapIndex));
 			mCommandList->SetGraphicsRootDescriptorTable(6, makeSrvHandle(ritem->mat->metallicSrvHeapIndex));
+			mCommandList->SetGraphicsRootDescriptorTable(13, makeSrvHandle(ritem->mat->alphaSrvHeapIndex));
 		}
 
 		mCommandList->DrawIndexedInstanced(
@@ -294,13 +426,22 @@ void ShapesApp::DrawRenderItems(const std::vector<RenderItem*>& ritems)
 void ShapesApp::OnResize()
 {
 	D3DApp::OnResize();
-	XMMATRIX proj = XMMatrixPerspectiveFovLH(0.25f * MathHelper::Pi, static_cast<float>(clientWidth) / clientHeight, 1.0f, 1000.0f);
+	UpdateProjectionMatrix();
+}
+
+void ShapesApp::UpdateProjectionMatrix()
+{
+	const float aspect = clientHeight > 0
+		? static_cast<float>(clientWidth) / static_cast<float>(clientHeight)
+		: 1.0f;
+	const float farZ = std::max(1000.0f, mSceneBoundsRadius * 6.0f);
+	const XMMATRIX proj = XMMatrixPerspectiveFovLH(0.25f * MathHelper::Pi, aspect, 0.1f, farZ);
 	XMStoreFloat4x4(&mProj, proj);
 }
 
 void ShapesApp::BuildRootSignature()
 {
-	CD3DX12_ROOT_PARAMETER rootParameters[13];
+	CD3DX12_ROOT_PARAMETER rootParameters[14];
 	rootParameters[0].InitAsConstantBufferView(0);
 	rootParameters[1].InitAsConstantBufferView(1);
 	rootParameters[2].InitAsConstantBufferView(2);
@@ -314,6 +455,7 @@ void ShapesApp::BuildRootSignature()
 	CD3DX12_DESCRIPTOR_RANGE brdfLutSrvTable;
 	CD3DX12_DESCRIPTOR_RANGE prefilteredEnvSrvTable;
 	CD3DX12_DESCRIPTOR_RANGE irradianceMapSrvTable;
+	CD3DX12_DESCRIPTOR_RANGE alphaSrvTable;
 
 	baseColorSrvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
 	normalSrvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1);
@@ -324,6 +466,7 @@ void ShapesApp::BuildRootSignature()
 	brdfLutSrvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 6);
 	prefilteredEnvSrvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 7);
 	irradianceMapSrvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 8);
+	alphaSrvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 9);
 
 	rootParameters[3].InitAsDescriptorTable(1, &baseColorSrvTable, D3D12_SHADER_VISIBILITY_PIXEL);
 	rootParameters[4].InitAsDescriptorTable(1, &normalSrvTable, D3D12_SHADER_VISIBILITY_PIXEL);
@@ -335,6 +478,7 @@ void ShapesApp::BuildRootSignature()
 	rootParameters[10].InitAsDescriptorTable(1, &prefilteredEnvSrvTable, D3D12_SHADER_VISIBILITY_PIXEL);
 	rootParameters[11].InitAsDescriptorTable(1, &irradianceMapSrvTable, D3D12_SHADER_VISIBILITY_PIXEL);
 	rootParameters[12].InitAsConstants(2, 3, 0, D3D12_SHADER_VISIBILITY_PIXEL);
+	rootParameters[13].InitAsDescriptorTable(1, &alphaSrvTable, D3D12_SHADER_VISIBILITY_PIXEL);
 
 	auto staticSamplers = GetStaticSamplers();
 	CD3DX12_ROOT_SIGNATURE_DESC rootSignatureDesc(
@@ -722,6 +866,7 @@ void ShapesApp::BuildPSO()
 	psoDesc.VS = { reinterpret_cast<BYTE*>(vsBytecode->GetBufferPointer()), vsBytecode->GetBufferSize() };
 	psoDesc.PS = { reinterpret_cast<BYTE*>(psBytecode->GetBufferPointer()), psBytecode->GetBufferSize() };
 	psoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+	psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
 	psoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
 	psoDesc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
 	psoDesc.SampleMask = UINT_MAX;
@@ -1241,6 +1386,7 @@ void ShapesApp::BuildMaterial()
 		material->normalSrvHeapIndex = textures[normalTexture]->srvHeapIndex;
 		material->roughnessSrvHeapIndex = textures[roughnessTexture]->srvHeapIndex;
 		material->metallicSrvHeapIndex = textures[metallicTexture]->srvHeapIndex;
+		material->alphaSrvHeapIndex = textures["white1x1Tex"]->srvHeapIndex;
 		material->baseColorFactor = baseColorFactor;
 		material->fresnelR0 = dielectricF0;
 		material->roughnessFactor = roughnessFactor;
@@ -1276,9 +1422,18 @@ void ShapesApp::BuildMaterial()
 	addMaterial("pbrFloor", "tileTex", "tileNormalTex", { 0.82f, 0.84f, 0.82f, 1.0f }, { 0.04f, 0.04f, 0.04f }, 0.95f, 0.0f);
 }
 
-void ShapesApp::BuildImportedPbrSphere()
+bool ShapesApp::BuildObjModel(
+	const std::wstring& objFilename,
+	const std::string& geometryName,
+	const std::string& materialPrefix)
 {
-	const std::filesystem::path objPath = std::filesystem::path("Models") / "Obj_PBRTest" / "Sphere.obj";
+	std::filesystem::path objPath(objFilename);
+	if (!std::filesystem::exists(objPath))
+	{
+		return false;
+	}
+
+	objPath = std::filesystem::weakly_canonical(objPath);
 	const std::filesystem::path objDirectory = objPath.parent_path();
 
 	tinyobj::ObjReaderConfig readerConfig;
@@ -1289,21 +1444,56 @@ void ShapesApp::BuildImportedPbrSphere()
 	if (!reader.ParseFromFile(objPath.string(), readerConfig))
 	{
 		OutputDebugStringA((std::string("Failed to load OBJ: ") + reader.Error() + "\n").c_str());
-		return;
+		return false;
+	}
+
+	if (!reader.Warning().empty())
+	{
+		OutputDebugStringA((std::string("OBJ warning: ") + reader.Warning() + "\n").c_str());
 	}
 
 	const auto& attrib = reader.GetAttrib();
 	const auto& shapes = reader.GetShapes();
 	const auto& sourceMaterials = reader.GetMaterials();
+	if (attrib.vertices.empty() || shapes.empty())
+	{
+		return false;
+	}
 
 	auto materialKeyForId = [&](int materialId)
 	{
 		if (materialId >= 0 && materialId < static_cast<int>(sourceMaterials.size()) && !sourceMaterials[materialId].name.empty())
 		{
-			return std::string("ornament_") + sourceMaterials[materialId].name;
+			return materialPrefix + "_" + SanitizeKey(sourceMaterials[materialId].name);
 		}
 
-		return std::string("ornament_default");
+		return materialPrefix + "_default";
+	};
+
+	auto loadMaterialTexture = [&](const std::string& textureName, const std::string& semantic, bool sRGB, int fallbackSrvIndex)
+	{
+		if (textureName.empty())
+		{
+			return fallbackSrvIndex;
+		}
+
+		const std::filesystem::path texturePath = ResolveObjTexturePath(objDirectory, textureName);
+		if (!std::filesystem::exists(texturePath))
+		{
+			OutputDebugStringA((std::string("Missing OBJ texture: ") + texturePath.string() + "\n").c_str());
+			return fallbackSrvIndex;
+		}
+
+		const std::string textureKey = "objtex_" + SanitizeKey(texturePath.lexically_normal().generic_string()) + "_" + semantic;
+		try
+		{
+			return LoadTextureAsset(textureKey, texturePath.wstring(), sRGB)->srvHeapIndex;
+		}
+		catch (const std::exception& e)
+		{
+			OutputDebugStringA((std::string("Failed to load OBJ texture: ") + texturePath.string() + " - " + e.what() + "\n").c_str());
+			return fallbackSrvIndex;
+		}
 	};
 
 	auto ensureMaterial = [&](int materialId)
@@ -1311,7 +1501,7 @@ void ShapesApp::BuildImportedPbrSphere()
 		const std::string materialKey = materialKeyForId(materialId);
 		if (materials.find(materialKey) != materials.end())
 		{
-			return;
+			return materialKey;
 		}
 
 		auto material = std::make_unique<Material>();
@@ -1321,64 +1511,56 @@ void ShapesApp::BuildImportedPbrSphere()
 		material->normalSrvHeapIndex = textures["defaultNormalTex"]->srvHeapIndex;
 		material->roughnessSrvHeapIndex = textures["white1x1Tex"]->srvHeapIndex;
 		material->metallicSrvHeapIndex = textures["white1x1Tex"]->srvHeapIndex;
+		material->alphaSrvHeapIndex = textures["white1x1Tex"]->srvHeapIndex;
 		material->baseColorFactor = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
 		material->fresnelR0 = XMFLOAT3(0.04f, 0.04f, 0.04f);
-		material->roughnessFactor = 1.0f;
+		material->roughnessFactor = 0.82f;
 		material->metallicFactor = 0.0f;
 		material->normalScale = 1.0f;
+		material->normalMapFlipY = 0.0f;
 		material->alphaCutoff = 0.1f;
 
 		if (materialId >= 0 && materialId < static_cast<int>(sourceMaterials.size()))
 		{
 			const auto& src = sourceMaterials[materialId];
+			const bool hasDiffuseColor = src.diffuse[0] > 0.0f || src.diffuse[1] > 0.0f || src.diffuse[2] > 0.0f;
 			material->baseColorFactor = XMFLOAT4(
-				src.diffuse[0] > 0.0f ? src.diffuse[0] : 1.0f,
-				src.diffuse[1] > 0.0f ? src.diffuse[1] : 1.0f,
-				src.diffuse[2] > 0.0f ? src.diffuse[2] : 1.0f,
+				hasDiffuseColor ? src.diffuse[0] : 1.0f,
+				hasDiffuseColor ? src.diffuse[1] : 1.0f,
+				hasDiffuseColor ? src.diffuse[2] : 1.0f,
 				src.dissolve > 0.0f ? src.dissolve : 1.0f);
 
-			material->roughnessFactor = src.roughness > 0.0f ? src.roughness : 1.0f;
-			material->metallicFactor = src.metallic_texname.empty() ? src.metallic : 1.0f;
-
-			if (!src.diffuse_texname.empty())
+			if (src.roughness > 0.0f)
 			{
-				const auto texturePath = objDirectory / src.diffuse_texname;
-				material->baseColorSrvHeapIndex = LoadTextureAsset(materialKey + "_base", texturePath.wstring(), true)->srvHeapIndex;
+				material->roughnessFactor = std::clamp(src.roughness, 0.05f, 1.0f);
 			}
+			else if (src.shininess > 0.0f)
+			{
+				material->roughnessFactor = std::clamp(std::sqrt(2.0f / (src.shininess + 2.0f)), 0.05f, 1.0f);
+			}
+
+			material->metallicFactor = src.metallic > 0.0f ? std::clamp(src.metallic, 0.0f, 1.0f) : 0.0f;
+			material->baseColorSrvHeapIndex = loadMaterialTexture(src.diffuse_texname, "base", true, material->baseColorSrvHeapIndex);
 
 			const std::string normalTextureName = !src.normal_texname.empty() ? src.normal_texname : src.bump_texname;
 			if (!normalTextureName.empty())
 			{
-				const auto texturePath = objDirectory / normalTextureName;
-				material->normalSrvHeapIndex = LoadTextureAsset(materialKey + "_normal", texturePath.wstring(), false)->srvHeapIndex;
-
-				std::string lowered = normalTextureName;
-				std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char ch)
-				{
-					return static_cast<char>(std::tolower(ch));
-				});
-				if (lowered.find("normalgl") != std::string::npos)
-				{
-					material->normalMapFlipY = 0.0f;
-				}
-
-				material->normalScale = 3.5f;
+				material->normalSrvHeapIndex = loadMaterialTexture(normalTextureName, "normal", false, material->normalSrvHeapIndex);
+				material->normalMapFlipY = ShouldFlipNormalY(normalTextureName) ? 1.0f : 0.0f;
+				material->normalScale = 1.0f;
 			}
 
-			if (!src.roughness_texname.empty())
+			material->roughnessSrvHeapIndex = loadMaterialTexture(src.roughness_texname, "roughness", false, material->roughnessSrvHeapIndex);
+			material->metallicSrvHeapIndex = loadMaterialTexture(src.metallic_texname, "metallic", false, material->metallicSrvHeapIndex);
+			material->alphaSrvHeapIndex = loadMaterialTexture(src.alpha_texname, "alpha", false, material->alphaSrvHeapIndex);
+			if (!src.alpha_texname.empty())
 			{
-				const auto texturePath = objDirectory / src.roughness_texname;
-				material->roughnessSrvHeapIndex = LoadTextureAsset(materialKey + "_roughness", texturePath.wstring(), false)->srvHeapIndex;
-			}
-
-			if (!src.metallic_texname.empty())
-			{
-				const auto texturePath = objDirectory / src.metallic_texname;
-				material->metallicSrvHeapIndex = LoadTextureAsset(materialKey + "_metallic", texturePath.wstring(), false)->srvHeapIndex;
+				material->alphaCutoff = 0.5f;
 			}
 		}
 
 		materials[materialKey] = std::move(material);
+		return materialKey;
 	};
 
 	std::map<std::string, std::vector<Vertex1>> groupedVertices;
@@ -1397,17 +1579,23 @@ void ShapesApp::BuildImportedPbrSphere()
 			}
 
 			const int materialId = faceIndex < shape.mesh.material_ids.size() ? shape.mesh.material_ids[faceIndex] : -1;
-			ensureMaterial(materialId);
-			const std::string materialKey = materialKeyForId(materialId);
+			const std::string materialKey = ensureMaterial(materialId);
 
 			XMFLOAT3 facePositions[3];
 			XMFLOAT3 faceNormals[3];
 			XMFLOAT2 faceTexcoords[3];
 			bool hasNormals = true;
+			bool validFace = true;
 
 			for (int vertexIndex = 0; vertexIndex < 3; ++vertexIndex)
 			{
 				const tinyobj::index_t idx = shape.mesh.indices[indexOffset + vertexIndex];
+				if (idx.vertex_index < 0)
+				{
+					validFace = false;
+					break;
+				}
+
 				facePositions[vertexIndex] = XMFLOAT3(
 					attrib.vertices[3 * static_cast<size_t>(idx.vertex_index) + 0],
 					attrib.vertices[3 * static_cast<size_t>(idx.vertex_index) + 1],
@@ -1437,6 +1625,12 @@ void ShapesApp::BuildImportedPbrSphere()
 				}
 			}
 
+			if (!validFace)
+			{
+				indexOffset += faceVertexCount;
+				continue;
+			}
+
 			if (!hasNormals)
 			{
 				const XMVECTOR p0 = XMLoadFloat3(&facePositions[0]);
@@ -1451,17 +1645,17 @@ void ShapesApp::BuildImportedPbrSphere()
 
 			auto& vertices = groupedVertices[materialKey];
 			auto& indices = groupedIndices[materialKey];
+			const XMFLOAT4 faceTangent = ComputeTriangleTangent(
+				facePositions[0],
+				facePositions[1],
+				facePositions[2],
+				faceTexcoords[0],
+				faceTexcoords[1],
+				faceTexcoords[2],
+				faceNormals[0]);
+
 			for (int vertexIndex = 0; vertexIndex < 3; ++vertexIndex)
 			{
-				const XMFLOAT4 faceTangent = ComputeTriangleTangent(
-					facePositions[0],
-					facePositions[1],
-					facePositions[2],
-					faceTexcoords[0],
-					faceTexcoords[1],
-					faceTexcoords[2],
-					faceNormals[vertexIndex]);
-
 				Vertex1 vertex = {};
 				vertex.Pos = facePositions[vertexIndex];
 				vertex.Normal = faceNormals[vertexIndex];
@@ -1477,13 +1671,14 @@ void ShapesApp::BuildImportedPbrSphere()
 
 	if (groupedVertices.empty())
 	{
-		return;
+		return false;
 	}
 
 	std::vector<Vertex1> mergedVertices;
 	std::vector<std::uint32_t> mergedIndices;
+	Bounds modelBounds;
 	auto geometry = std::make_unique<MeshGeometry>();
-	geometry->name = "ornamentGeo";
+	geometry->name = geometryName;
 	geometry->mVertexByteStride = sizeof(Vertex1);
 	geometry->mIndexFormat = DXGI_FORMAT_R32_UINT;
 
@@ -1495,6 +1690,11 @@ void ShapesApp::BuildImportedPbrSphere()
 		submesh.startIndexLocation = static_cast<UINT>(mergedIndices.size());
 		submesh.indexCount = static_cast<UINT>(indices.size());
 
+		for (const auto& vertex : vertices)
+		{
+			ExpandBounds(modelBounds, vertex.Pos);
+		}
+
 		mergedVertices.insert(mergedVertices.end(), vertices.begin(), vertices.end());
 		for (std::uint32_t index : indices)
 		{
@@ -1502,7 +1702,12 @@ void ShapesApp::BuildImportedPbrSphere()
 		}
 
 		geometry->mDrawArgs[materialKey] = submesh;
+		geometry->mSubmeshMaterials[materialKey] = materialKey;
+		geometry->mSubmeshOrder.push_back(materialKey);
 	}
+
+	FinalizeBounds(modelBounds, mergedVertices);
+	geometry->bounds = modelBounds;
 
 	const UINT vbByteSize = static_cast<UINT>(mergedVertices.size() * sizeof(Vertex1));
 	const UINT ibByteSizeLocal = static_cast<UINT>(mergedIndices.size() * sizeof(std::uint32_t));
@@ -1517,7 +1722,36 @@ void ShapesApp::BuildImportedPbrSphere()
 	geometry->mVertexBufferGPU = CreateDefaultBuffer(md3dDevice.Get(), mCommandList.Get(), vbByteSize, mergedVertices.data(), geometry->mVertexBufferUploader);
 	geometry->mIndexBufferGPU = CreateDefaultBuffer(md3dDevice.Get(), mCommandList.Get(), ibByteSizeLocal, mergedIndices.data(), geometry->mIndexBufferUploader);
 
-	geometries["ornamentGeo"] = std::move(geometry);
+	geometries[geometryName] = std::move(geometry);
+	if (std::find(mSceneModelGeometryNames.begin(), mSceneModelGeometryNames.end(), geometryName) == mSceneModelGeometryNames.end())
+	{
+		mSceneModelGeometryNames.push_back(geometryName);
+	}
+
+	return true;
+}
+
+void ShapesApp::BuildStaticSceneModels()
+{
+	mSceneModelGeometryNames.clear();
+
+	const std::wstring sponzaCandidates[] =
+	{
+		L"D:/Computer Graphics/PathTracer/PathTracer-CPP/Model/sponza/sponza.obj",
+		L"Models/Sponza/sponza.obj",
+		L"Models/Sponza/Sponza.obj",
+		L"Models/sponza/sponza.obj"
+	};
+
+	for (const auto& candidate : sponzaCandidates)
+	{
+		if (BuildObjModel(candidate, "sponzaGeo", "sponza"))
+		{
+			return;
+		}
+	}
+
+	OutputDebugStringA("Sponza OBJ not found. Falling back to the procedural validation scene.\n");
 }
 
 void ShapesApp::BuildRenderItems()
@@ -1529,18 +1763,45 @@ void ShapesApp::BuildRenderItems()
 	mAllItem.clear();
 
 	UINT nextObjCBIndex = 0;
-	auto addTestItem = [&](const std::string& drawKey, const std::string& materialKey, CXMMATRIX worldMatrix)
+	auto addSubmeshItem = [&](MeshGeometry* geo, const std::string& drawKey, const std::string& materialKey, CXMMATRIX worldMatrix)
 	{
+		const SubmeshGeometry* submesh = nullptr;
+		if (geo != nullptr)
+		{
+			const auto drawIt = geo->mDrawArgs.find(drawKey);
+			if (drawIt == geo->mDrawArgs.end())
+			{
+				return;
+			}
+			submesh = &drawIt->second;
+		}
+		else
+		{
+			const auto drawIt = mDrawArgs.find(drawKey);
+			if (drawIt == mDrawArgs.end())
+			{
+				return;
+			}
+			submesh = &drawIt->second;
+		}
+
 		auto renderItem = std::make_unique<RenderItem>();
 		XMStoreFloat4x4(&renderItem->world, worldMatrix);
+		renderItem->geo = geo;
 		renderItem->mObjCBIndex = nextObjCBIndex++;
 		renderItem->mPrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-		renderItem->indexCount = mDrawArgs[drawKey].indexCount;
-		renderItem->baseVertexLocation = mDrawArgs[drawKey].baseVertexLocation;
-		renderItem->startIndexLocation = mDrawArgs[drawKey].startIndexLocation;
-		renderItem->mat = materials[materialKey].get();
+		renderItem->indexCount = submesh->indexCount;
+		renderItem->baseVertexLocation = submesh->baseVertexLocation;
+		renderItem->startIndexLocation = submesh->startIndexLocation;
+		auto materialIt = materials.find(materialKey);
+		renderItem->mat = materialIt != materials.end() ? materialIt->second.get() : materials["pbrFloor"].get();
 		renderItem->layer = RenderLayer::Opaque;
 		mAllItem.push_back(std::move(renderItem));
+	};
+
+	auto addTestItem = [&](const std::string& drawKey, const std::string& materialKey, CXMMATRIX worldMatrix)
+	{
+		addSubmeshItem(nullptr, drawKey, materialKey, worldMatrix);
 	};
 
 	auto addSkyItem = [&]()
@@ -1557,16 +1818,73 @@ void ShapesApp::BuildRenderItems()
 	};
 
 	addSkyItem();
-	addTestItem("grid", "pbrFloor", XMMatrixIdentity());
-	addTestItem("sphere", "pbrMetalSphere", XMMatrixScaling(2.0f, 2.0f, 2.0f) * XMMatrixTranslation(0.0f, 1.0f, 0.0f));
+
+	Bounds importedBounds;
+	bool addedImportedModel = false;
+	for (const auto& geometryName : mSceneModelGeometryNames)
+	{
+		auto geometryIt = geometries.find(geometryName);
+		if (geometryIt == geometries.end())
+		{
+			continue;
+		}
+
+		MeshGeometry* geometry = geometryIt->second.get();
+		for (const auto& submeshKey : geometry->mSubmeshOrder)
+		{
+			const auto materialIt = geometry->mSubmeshMaterials.find(submeshKey);
+			const std::string materialKey = materialIt != geometry->mSubmeshMaterials.end()
+				? materialIt->second
+				: "pbrFloor";
+			addSubmeshItem(geometry, submeshKey, materialKey, XMMatrixIdentity());
+			addedImportedModel = true;
+		}
+
+		if (geometry->bounds.valid)
+		{
+			ExpandBounds(importedBounds, geometry->bounds.min);
+			ExpandBounds(importedBounds, geometry->bounds.max);
+		}
+	}
+
+	if (addedImportedModel && importedBounds.valid)
+	{
+		const XMVECTOR minCorner = XMLoadFloat3(&importedBounds.min);
+		const XMVECTOR maxCorner = XMLoadFloat3(&importedBounds.max);
+		const float diagonal = XMVectorGetX(XMVector3Length(maxCorner - minCorner));
+		mSceneBoundsRadius = std::max(1.0f, 0.5f * diagonal);
+
+		if (std::find(mSceneModelGeometryNames.begin(), mSceneModelGeometryNames.end(), "sponzaGeo") != mSceneModelGeometryNames.end())
+		{
+			mSceneBoundsCenter = XMFLOAT3(80.0f, 320.0f, 80.0f);
+			mTheta = 20.0f * XM_PI;
+			mPhi = 5.0f * XM_PI;
+			mRadius = 1440.0f;
+		}
+		else
+		{
+			mSceneBoundsCenter = XMFLOAT3(
+				0.5f * (importedBounds.min.x + importedBounds.max.x),
+				0.5f * (importedBounds.min.y + importedBounds.max.y),
+				0.5f * (importedBounds.min.z + importedBounds.max.z));
+			mRadius = std::max(5.0f, mSceneBoundsRadius * 1.55f);
+		}
+	}
+	else
+	{
+		addTestItem("grid", "pbrFloor", XMMatrixIdentity());
+		addTestItem("sphere", "pbrMetalSphere", XMMatrixScaling(2.0f, 2.0f, 2.0f) * XMMatrixTranslation(0.0f, 1.0f, 0.0f));
+
+		mSceneBoundsCenter = XMFLOAT3(0.0f, 1.0f, 0.0f);
+		mSceneBoundsRadius = 18.0f;
+	}
 
 	for (auto& renderItem : mAllItem)
 	{
 		mRitemLayer[(int)renderItem->layer].push_back(renderItem.get());
 	}
 
-	mSceneBoundsCenter = XMFLOAT3(0.0f, 1.0f, 0.0f);
-	mSceneBoundsRadius = 18.0f;
+	UpdateProjectionMatrix();
 }
 
 void ShapesApp::BuildFrameResource()
@@ -1633,15 +1951,15 @@ void ShapesApp::UpdatePassCBs(const GameTimer& gt)
 	const float y = mRadius * cosf(mPhi);
 	const float z = mRadius * sinf(mPhi) * sinf(mTheta);
 
-	const XMVECTOR eyePos = XMVectorSet(x, y, z, 1.0f);
-	const XMVECTOR target = XMVectorZero();
+	const XMVECTOR target = XMLoadFloat3(&mSceneBoundsCenter);
+	const XMVECTOR eyePos = target + XMVectorSet(x, y, z, 0.0f);
 	const XMVECTOR up = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
 	const XMMATRIX view = XMMatrixLookAtLH(eyePos, target, up);
 	const XMMATRIX proj = XMLoadFloat4x4(&mProj);
 	const XMMATRIX viewProj = view * proj;
 
 	XMStoreFloat4x4(&passConstants.ViewProj, XMMatrixTranspose(viewProj));
-	passConstants.cameraPosW = XMFLOAT3(x, y, z);
+	XMStoreFloat3(&passConstants.cameraPosW, eyePos);
 	passConstants.totalTime = gt.TotalTime();
 	passConstants.ambientLight = { 0.012f, 0.012f, 0.016f, 1.0f };
 	passConstants.envMapMipCount = static_cast<float>(textures[mEnvironmentTextureName]->resource->GetDesc().MipLevels);

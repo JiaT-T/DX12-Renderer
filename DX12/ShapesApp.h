@@ -52,6 +52,15 @@ public:
 		UINT startIndexLocation = 0;
 	};
 
+	struct Bounds
+	{
+		XMFLOAT3 min = { 0.0f, 0.0f, 0.0f };
+		XMFLOAT3 max = { 0.0f, 0.0f, 0.0f };
+		XMFLOAT3 center = { 0.0f, 0.0f, 0.0f };
+		float radius = 0.0f;
+		bool valid = false;
+	};
+
 	struct MeshGeometry
 	{
 		std::string name;
@@ -70,6 +79,9 @@ public:
 		DXGI_FORMAT mIndexFormat = DXGI_FORMAT_R32_UINT;
 
 		std::unordered_map<std::string, SubmeshGeometry> mDrawArgs;
+		std::unordered_map<std::string, std::string> mSubmeshMaterials;
+		std::vector<std::string> mSubmeshOrder;
+		Bounds bounds;
 	};
 
 	struct RenderItem
@@ -113,7 +125,8 @@ public:
 	void BuildSkull();
 	void BuildBoxGeometry();
 	void BuildGridGeomerty();
-	void BuildImportedPbrSphere();
+	bool BuildObjModel(const std::wstring& objFilename, const std::string& geometryName, const std::string& materialPrefix);
+	void BuildStaticSceneModels();
 	void BuildTreeBillboardGeometry();
 
 	void LoadTextures();
@@ -126,6 +139,7 @@ public:
 	void UpdatePassCBs(const GameTimer& gt);
 	void UpdateMatCBs();
 	void UpdateShadowTransform();
+	void UpdateProjectionMatrix();
 
 	void OnKeyboardInput(const GameTimer& gt);
 	Texture* LoadTextureAsset(const std::string& textureName, const std::wstring& filename, bool sRGB);
@@ -145,6 +159,7 @@ protected:
 	std::unordered_map<std::string, std::unique_ptr<Material>> materials;
 	std::unordered_map<std::string, std::unique_ptr<Texture>> textures;
 	std::vector<std::unique_ptr<RenderItem>> mAllItem;
+	std::vector<std::string> mSceneModelGeometryNames;
 	std::string mEnvironmentTextureName = "suburbanGardenHdrTex";
 	UINT mNextSrvHeapIndex = 0;
 	UINT mShadowMapSrvHeapIndex = std::numeric_limits<UINT>::max();
