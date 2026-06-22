@@ -90,6 +90,7 @@ public:
 
 		MeshGeometry* geo = nullptr;
 		XMFLOAT4X4 world = MathHelper::Identity4x4();
+		XMFLOAT4X4 localWorld = MathHelper::Identity4x4();
 		XMFLOAT4X4 WorldInversed = MathHelper::Identity4x4();
 
 		UINT mObjCBIndex = static_cast<UINT>(-1);
@@ -104,9 +105,40 @@ public:
 		Material* mat = nullptr;
 	};
 
+	struct SceneObject
+	{
+		std::string name;
+		XMFLOAT3 position = { 0.0f, 0.0f, 0.0f };
+		XMFLOAT3 rotation = { 0.0f, 0.0f, 0.0f };
+		XMFLOAT3 scale = { 1.0f, 1.0f, 1.0f };
+		XMFLOAT4X4 world = MathHelper::Identity4x4();
+		std::vector<RenderItem*> renderItems;
+	};
+
+	struct PendingFrameCapture
+	{
+		ComPtr<ID3D12Resource> readbackBuffer = nullptr;
+		D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+		UINT width = 0;
+		UINT height = 0;
+		std::wstring filename;
+		bool valid = false;
+	};
+
+	enum class TransformTool
+	{
+		Translate = 0,
+		Rotate,
+		Scale
+	};
+
 	void Draw() override;
 	void DrawRenderItems(const std::vector<RenderItem*>& ritems);
 	void DrawSceneToShadowMap();
+	LRESULT MsgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) override;
+	void OnMouseDown(WPARAM btnState, int x, int y) override;
+	void OnMouseUp(WPARAM btnState, int x, int y) override;
+	void OnMouseMove(WPARAM btnState, int x, int y) override;
 	void OnResize() override;
 
 	void BuildRootSignature();
@@ -142,6 +174,30 @@ public:
 	void UpdateProjectionMatrix();
 
 	void OnKeyboardInput(const GameTimer& gt);
+	void InitEditorUI();
+	void ShutdownEditorUI();
+	void DrawEditorUI();
+	void DrawDebugWindow();
+	void DrawTransformGizmo();
+	bool EditorWantsMouse() const;
+	void ProcessEditorCommands();
+	bool TryOpenObjFile(std::wstring& outPath) const;
+	bool ImportObjModelAtRuntime(const std::wstring& objPath);
+	void QueueFrameCapture();
+	bool ScheduleFrameCapture();
+	bool WritePendingFrameCaptureToPng();
+	std::wstring MakeFrameCapturePath() const;
+	void RegisterSceneObject(
+		const std::string& name,
+		const std::vector<RenderItem*>& renderItems,
+		const XMFLOAT3& position,
+		const XMFLOAT3& rotation,
+		const XMFLOAT3& scale);
+	void ApplySceneObjectTransform(SceneObject& sceneObject);
+	SceneObject* GetSelectedSceneObject();
+	void ResetCameraToSceneView();
+	XMVECTOR GetCameraForwardVector() const;
+	float GetCameraMoveUnitsPerPixel() const;
 	Texture* LoadTextureAsset(const std::string& textureName, const std::wstring& filename, bool sRGB);
 	Texture* GetTextureAsset(const std::string& textureName);
 
@@ -159,6 +215,8 @@ protected:
 	std::unordered_map<std::string, std::unique_ptr<Material>> materials;
 	std::unordered_map<std::string, std::unique_ptr<Texture>> textures;
 	std::vector<std::unique_ptr<RenderItem>> mAllItem;
+	std::vector<SceneObject> mSceneObjects;
+	int mSelectedSceneObjectIndex = -1;
 	std::vector<std::string> mSceneModelGeometryNames;
 	std::string mEnvironmentTextureName = "suburbanGardenHdrTex";
 	UINT mNextSrvHeapIndex = 0;
@@ -177,6 +235,7 @@ protected:
 	std::vector<D3D12_INPUT_ELEMENT_DESC> treeBillboardInputLayoutDesc;
 
 	ComPtr<ID3D12DescriptorHeap> mSrvHeap = nullptr;
+	ComPtr<ID3D12DescriptorHeap> mImGuiSrvHeap = nullptr;
 	ComPtr<ID3D12DescriptorHeap> mShadowMapDsvHeap = nullptr;
 	ComPtr<ID3D12DescriptorHeap> mBrdfLutRtvHeap = nullptr;
 	ComPtr<ID3D12DescriptorHeap> mPrefilteredEnvMapRtvHeap = nullptr;
@@ -214,8 +273,21 @@ protected:
 	D3D12_RECT mBrdfLutScissorRect = { 0, 0, static_cast<LONG>(BrdfLutSize), static_cast<LONG>(BrdfLutSize) };
 	XMFLOAT3 mSceneBoundsCenter = { 0.0f, 1.0f, 0.0f };
 	float mSceneBoundsRadius = 16.0f;
+	bool mEditorInitialized = false;
+	bool mEditorVisible = true;
+	TransformTool mTransformTool = TransformTool::Translate;
+	bool mUseLocalGizmoMode = false;
+	bool mOpenImportDialogRequested = false;
+	bool mFrameCaptureRequested = false;
+	int mImportedModelCounter = 0;
+	std::string mEditorStatus;
+	PendingFrameCapture mPendingFrameCapture;
 
 protected:
+	XMFLOAT3 mCameraPosition = { 0.0f, 0.0f, -5.0f };
+	float mCameraYaw = 0.0f;
+	float mCameraPitch = 0.0f;
+	XMFLOAT4X4 mView = MathHelper::Identity4x4();
 	XMFLOAT4X4 mProj = MathHelper::Identity4x4();
 	std::vector<std::unique_ptr<FrameResources>> mFrameResourcesArray;
 	UINT mCurrentFrameResourcesIndex = 0;

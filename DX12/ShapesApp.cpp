@@ -5,12 +5,27 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cfloat>
 #include <cmath>
+#include <commdlg.h>
 #include <filesystem>
 #include <map>
+#include <vector>
+#include <wincodec.h>
+
+#include "imgui.h"
+#include "imgui_impl_dx12.h"
+#include "imgui_impl_win32.h"
+#include "ImGuizmo.h"
+
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 using namespace DirectX;
 using namespace Microsoft::WRL;
+
+#pragma comment(lib, "Comdlg32.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "windowscodecs.lib")
 
 namespace
 {
@@ -212,6 +227,7 @@ ShapesApp::~ShapesApp()
 	{
 		FlushCommandQueue();
 	}
+	ShutdownEditorUI();
 }
 
 bool ShapesApp::InitRnederItems(HINSTANCE hInstance, int nShowCmd, std::wstring customCaption)
@@ -255,6 +271,8 @@ bool ShapesApp::InitRnederItems(HINSTANCE hInstance, int nShowCmd, std::wstring 
 	ID3D12CommandList* cmdLists[] = { mCommandList.Get() };
 	mCommandQueue->ExecuteCommandLists(_countof(cmdLists), cmdLists);
 	FlushCommandQueue();
+
+	InitEditorUI();
 
 	mAppInitialized = true;
 	return true;
@@ -314,6 +332,9 @@ void ShapesApp::Draw()
 	mCommandList->SetPipelineState(mPSOs["opaque"].Get());
 	DrawRenderItems(mRitemLayer[(int)RenderLayer::Opaque]);
 
+	DrawEditorUI();
+	const bool frameCaptureScheduled = ScheduleFrameCapture();
+
 	auto barrierToPresent = CD3DX12_RESOURCE_BARRIER::Transition(
 		mSwapChainBuffer[mCurrentBackBuffer].Get(),
 		D3D12_RESOURCE_STATE_RENDER_TARGET,
@@ -329,6 +350,755 @@ void ShapesApp::Draw()
 
 	mCurrentFrameResources->mFenceCPU = ++mCurrentFence;
 	mCommandQueue->Signal(mFence.Get(), mCurrentFence);
+
+	if (frameCaptureScheduled)
+	{
+		FlushCommandQueue();
+		WritePendingFrameCaptureToPng();
+	}
+}
+
+LRESULT ShapesApp::MsgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+	if (mEditorInitialized && ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam))
+	{
+		return true;
+	}
+
+	return D3DApp::MsgProc(hwnd, msg, wParam, lParam);
+}
+
+void ShapesApp::OnMouseDown(WPARAM btnState, int x, int y)
+{
+	if (EditorWantsMouse())
+	{
+		mLastMousePos.x = x;
+		mLastMousePos.y = y;
+		return;
+	}
+
+	mLastMousePos.x = x;
+	mLastMousePos.y = y;
+	SetCapture(mhMainWnd);
+}
+
+void ShapesApp::OnMouseUp(WPARAM btnState, int x, int y)
+{
+	if (EditorWantsMouse())
+	{
+		ReleaseCapture();
+		return;
+	}
+
+	ReleaseCapture();
+}
+
+void ShapesApp::OnMouseMove(WPARAM btnState, int x, int y)
+{
+	if (EditorWantsMouse())
+	{
+		mLastMousePos.x = x;
+		mLastMousePos.y = y;
+		return;
+	}
+
+	const float dx = static_cast<float>(x - mLastMousePos.x);
+	const float dy = static_cast<float>(y - mLastMousePos.y);
+	const float moveUnitsPerPixel = GetCameraMoveUnitsPerPixel();
+
+	if ((btnState & MK_RBUTTON) != 0)
+	{
+		constexpr float rotateRadiansPerPixel = 0.005f;
+		mCameraYaw -= dx * rotateRadiansPerPixel;
+		mCameraPitch -= dy * rotateRadiansPerPixel;
+		mCameraPitch = MathHelper::Clamp(
+			mCameraPitch,
+			XMConvertToRadians(-89.0f),
+			XMConvertToRadians(89.0f));
+	}
+	else if ((btnState & MK_LBUTTON) != 0)
+	{
+		const XMVECTOR forward = GetCameraForwardVector();
+		const XMVECTOR position = XMLoadFloat3(&mCameraPosition);
+		XMStoreFloat3(&mCameraPosition, position + forward * (-dy * moveUnitsPerPixel));
+	}
+	else if ((btnState & MK_MBUTTON) != 0)
+	{
+		const XMVECTOR up = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+		const XMVECTOR position = XMLoadFloat3(&mCameraPosition);
+		XMStoreFloat3(&mCameraPosition, position + up * (-dy * moveUnitsPerPixel));
+	}
+
+	mLastMousePos.x = x;
+	mLastMousePos.y = y;
+}
+
+void ShapesApp::InitEditorUI()
+{
+	if (mEditorInitialized)
+	{
+		return;
+	}
+
+	D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+	heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+	heapDesc.NumDescriptors = 1;
+	heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+	ThrowIfFailed(md3dDevice->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&mImGuiSrvHeap)));
+
+	IMGUI_CHECKVERSION();
+	ImGui::CreateContext();
+	ImGuiIO& io = ImGui::GetIO();
+	io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+	ImGui::StyleColorsDark();
+
+	ImGui_ImplWin32_Init(mhMainWnd);
+	ImGui_ImplDX12_Init(
+		md3dDevice.Get(),
+		static_cast<int>(mFrameResourcesCount),
+		DXGI_FORMAT_R8G8B8A8_UNORM,
+		mImGuiSrvHeap.Get(),
+		mImGuiSrvHeap->GetCPUDescriptorHandleForHeapStart(),
+		mImGuiSrvHeap->GetGPUDescriptorHandleForHeapStart());
+
+	mEditorInitialized = true;
+}
+
+void ShapesApp::ShutdownEditorUI()
+{
+	if (!mEditorInitialized)
+	{
+		return;
+	}
+
+	ImGui_ImplDX12_Shutdown();
+	ImGui_ImplWin32_Shutdown();
+	ImGui::DestroyContext();
+	mEditorInitialized = false;
+}
+
+void ShapesApp::DrawEditorUI()
+{
+	if (!mEditorInitialized)
+	{
+		return;
+	}
+
+	ImGui_ImplDX12_NewFrame();
+	ImGui_ImplWin32_NewFrame();
+	ImGui::NewFrame();
+	ImGuizmo::BeginFrame();
+
+	if (mEditorVisible)
+	{
+		DrawDebugWindow();
+	}
+	DrawTransformGizmo();
+
+	ImGui::Render();
+	ID3D12DescriptorHeap* descriptorHeaps[] = { mImGuiSrvHeap.Get() };
+	mCommandList->SetDescriptorHeaps(_countof(descriptorHeaps), descriptorHeaps);
+	ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), mCommandList.Get());
+}
+
+void ShapesApp::DrawDebugWindow()
+{
+	ImGui::SetNextWindowPos(ImVec2(8.0f, 8.0f), ImGuiCond_Always);
+	ImGui::SetNextWindowSize(ImVec2(320.0f, 360.0f), ImGuiCond_FirstUseEver);
+	ImGui::Begin("Renderer Debug", &mEditorVisible, ImGuiWindowFlags_NoCollapse);
+	ImGui::Text("Frame %.3f ms (%.1f FPS)", 1000.0f / ImGui::GetIO().Framerate, ImGui::GetIO().Framerate);
+	ImGui::Text("Scene items: %d", static_cast<int>(mAllItem.size()));
+	ImGui::Text("Objects: %d", static_cast<int>(mSceneObjects.size()));
+
+	if (ImGui::Button("Import OBJ"))
+	{
+		mOpenImportDialogRequested = true;
+	}
+	ImGui::SameLine();
+	if (ImGui::Button("Save Current Frame"))
+	{
+		QueueFrameCapture();
+	}
+
+	ImGui::SliderAngle("Light Yaw", &sunTheta, -180.0f, 180.0f);
+	ImGui::SliderAngle("Light Pitch", &sunPhi, 5.0f, 90.0f);
+	sunPhi = MathHelper::Clamp(sunPhi, 0.1f, XM_PIDIV2);
+
+	if (ImGui::RadioButton("Move", mTransformTool == TransformTool::Translate))
+	{
+		mTransformTool = TransformTool::Translate;
+	}
+	ImGui::SameLine();
+	if (ImGui::RadioButton("Rotate", mTransformTool == TransformTool::Rotate))
+	{
+		mTransformTool = TransformTool::Rotate;
+	}
+	ImGui::SameLine();
+	if (ImGui::RadioButton("Scale", mTransformTool == TransformTool::Scale))
+	{
+		mTransformTool = TransformTool::Scale;
+	}
+	ImGui::Checkbox("Local space", &mUseLocalGizmoMode);
+
+	if (ImGui::BeginListBox("Object", ImVec2(-FLT_MIN, 120.0f)))
+	{
+		for (int i = 0; i < static_cast<int>(mSceneObjects.size()); ++i)
+		{
+			const bool selected = i == mSelectedSceneObjectIndex;
+			if (ImGui::Selectable(mSceneObjects[i].name.c_str(), selected))
+			{
+				mSelectedSceneObjectIndex = i;
+			}
+			if (selected)
+			{
+				ImGui::SetItemDefaultFocus();
+			}
+		}
+		ImGui::EndListBox();
+	}
+
+	if (SceneObject* selectedObject = GetSelectedSceneObject())
+	{
+		float position[3] =
+		{
+			selectedObject->position.x,
+			selectedObject->position.y,
+			selectedObject->position.z
+		};
+		float rotationDegrees[3] =
+		{
+			XMConvertToDegrees(selectedObject->rotation.x),
+			XMConvertToDegrees(selectedObject->rotation.y),
+			XMConvertToDegrees(selectedObject->rotation.z)
+		};
+		float scale[3] =
+		{
+			selectedObject->scale.x,
+			selectedObject->scale.y,
+			selectedObject->scale.z
+		};
+
+		bool changed = false;
+		changed |= ImGui::InputFloat3("Position", position, "%.3f");
+		changed |= ImGui::InputFloat3("Rotation", rotationDegrees, "%.3f");
+		changed |= ImGui::InputFloat3("Scale", scale, "%.3f");
+
+		if (changed)
+		{
+			selectedObject->position = XMFLOAT3(position[0], position[1], position[2]);
+			selectedObject->rotation = XMFLOAT3(
+				XMConvertToRadians(rotationDegrees[0]),
+				XMConvertToRadians(rotationDegrees[1]),
+				XMConvertToRadians(rotationDegrees[2]));
+			selectedObject->scale = XMFLOAT3(
+				std::max(0.001f, scale[0]),
+				std::max(0.001f, scale[1]),
+				std::max(0.001f, scale[2]));
+			ApplySceneObjectTransform(*selectedObject);
+		}
+	}
+	if (!mEditorStatus.empty())
+	{
+		ImGui::Separator();
+		ImGui::TextWrapped("%s", mEditorStatus.c_str());
+	}
+	ImGui::End();
+}
+
+void ShapesApp::DrawTransformGizmo()
+{
+	SceneObject* selectedObject = GetSelectedSceneObject();
+	if (selectedObject == nullptr)
+	{
+		return;
+	}
+
+	ImGuizmo::SetOrthographic(false);
+	ImGuizmo::SetDrawlist(ImGui::GetForegroundDrawList());
+	ImGuizmo::SetRect(0.0f, 0.0f, static_cast<float>(clientWidth), static_cast<float>(clientHeight));
+
+	ImGuizmo::OPERATION operation = ImGuizmo::TRANSLATE;
+	switch (mTransformTool)
+	{
+	case TransformTool::Translate:
+		operation = ImGuizmo::TRANSLATE;
+		break;
+	case TransformTool::Rotate:
+		operation = ImGuizmo::ROTATE;
+		break;
+	case TransformTool::Scale:
+		operation = ImGuizmo::SCALE;
+		break;
+	default:
+		break;
+	}
+
+	ImGuizmo::MODE mode = mUseLocalGizmoMode ? ImGuizmo::LOCAL : ImGuizmo::WORLD;
+	if (operation == ImGuizmo::SCALE)
+	{
+		mode = ImGuizmo::LOCAL;
+	}
+
+	float objectMatrix[16] = {};
+	std::copy(
+		&selectedObject->world.m[0][0],
+		&selectedObject->world.m[0][0] + 16,
+		objectMatrix);
+
+	if (ImGuizmo::Manipulate(
+		&mView.m[0][0],
+		&mProj.m[0][0],
+		operation,
+		mode,
+		objectMatrix))
+	{
+		float position[3] = {};
+		float rotationDegrees[3] = {};
+		float scale[3] = {};
+		ImGuizmo::DecomposeMatrixToComponents(objectMatrix, position, rotationDegrees, scale);
+
+		selectedObject->position = XMFLOAT3(position[0], position[1], position[2]);
+		selectedObject->rotation = XMFLOAT3(
+			XMConvertToRadians(rotationDegrees[0]),
+			XMConvertToRadians(rotationDegrees[1]),
+			XMConvertToRadians(rotationDegrees[2]));
+		selectedObject->scale = XMFLOAT3(
+			std::max(0.001f, scale[0]),
+			std::max(0.001f, scale[1]),
+			std::max(0.001f, scale[2]));
+		ApplySceneObjectTransform(*selectedObject);
+	}
+}
+
+bool ShapesApp::EditorWantsMouse() const
+{
+	if (!mEditorInitialized || ImGui::GetCurrentContext() == nullptr)
+	{
+		return false;
+	}
+
+	return ImGui::GetIO().WantCaptureMouse || ImGuizmo::IsOver() || ImGuizmo::IsUsing();
+}
+
+void ShapesApp::ProcessEditorCommands()
+{
+	if (!mOpenImportDialogRequested)
+	{
+		return;
+	}
+
+	mOpenImportDialogRequested = false;
+
+	std::wstring objPath;
+	if (!TryOpenObjFile(objPath))
+	{
+		mEditorStatus = "Import canceled";
+		return;
+	}
+
+	if (ImportObjModelAtRuntime(objPath))
+	{
+		mEditorStatus = "Imported " + std::filesystem::path(objPath).filename().string();
+	}
+	else
+	{
+		mEditorStatus = "Failed to import OBJ";
+	}
+}
+
+bool ShapesApp::TryOpenObjFile(std::wstring& outPath) const
+{
+	wchar_t filename[MAX_PATH] = {};
+	OPENFILENAMEW ofn = {};
+	ofn.lStructSize = sizeof(ofn);
+	ofn.hwndOwner = mhMainWnd;
+	ofn.lpstrFilter = L"Wavefront OBJ (*.obj)\0*.obj\0All Files (*.*)\0*.*\0";
+	ofn.lpstrFile = filename;
+	ofn.nMaxFile = _countof(filename);
+	ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+
+	if (!GetOpenFileNameW(&ofn))
+	{
+		return false;
+	}
+
+	outPath = filename;
+	return true;
+}
+
+bool ShapesApp::ImportObjModelAtRuntime(const std::wstring& objPath)
+{
+	try
+	{
+		FlushCommandQueue();
+		ThrowIfFailed(mDirectCmdListAlloc->Reset());
+		ThrowIfFailed(mCommandList->Reset(mDirectCmdListAlloc.Get(), nullptr));
+
+		const std::filesystem::path path(objPath);
+		const std::string stem = SanitizeKey(path.stem().string());
+		const std::string baseName = "import_" + std::to_string(++mImportedModelCounter) + "_" + (stem.empty() ? "model" : stem);
+		const std::string geometryName = baseName + "Geo";
+
+		const bool built = BuildObjModel(objPath, geometryName, baseName);
+
+		ThrowIfFailed(mCommandList->Close());
+		if (!built)
+		{
+			return false;
+		}
+
+		ID3D12CommandList* cmdLists[] = { mCommandList.Get() };
+		mCommandQueue->ExecuteCommandLists(_countof(cmdLists), cmdLists);
+		FlushCommandQueue();
+
+		BuildRenderItems();
+		BuildFrameResource();
+		BuildShaderResourceView();
+
+		for (int i = 0; i < static_cast<int>(mSceneObjects.size()); ++i)
+		{
+			if (mSceneObjects[i].name == geometryName)
+			{
+				mSelectedSceneObjectIndex = i;
+				break;
+			}
+		}
+
+		return true;
+	}
+	catch (const std::exception& e)
+	{
+		mEditorStatus = std::string("Import error: ") + e.what();
+		return false;
+	}
+}
+
+void ShapesApp::QueueFrameCapture()
+{
+	if (mFrameCaptureRequested || mPendingFrameCapture.valid)
+	{
+		mEditorStatus = "Frame capture already pending";
+		return;
+	}
+
+	mPendingFrameCapture.filename = MakeFrameCapturePath();
+	mFrameCaptureRequested = true;
+	mEditorStatus = "Frame capture queued";
+}
+
+bool ShapesApp::ScheduleFrameCapture()
+{
+	if (!mFrameCaptureRequested)
+	{
+		return false;
+	}
+
+	mFrameCaptureRequested = false;
+	mPendingFrameCapture.valid = false;
+
+	ID3D12Resource* backBuffer = mSwapChainBuffer[mCurrentBackBuffer].Get();
+	const D3D12_RESOURCE_DESC backBufferDesc = backBuffer->GetDesc();
+	if (backBufferDesc.Format != DXGI_FORMAT_R8G8B8A8_UNORM)
+	{
+		mEditorStatus = "Frame capture failed: unsupported back buffer format";
+		return false;
+	}
+
+	D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+	UINT numRows = 0;
+	UINT64 rowSizeInBytes = 0;
+	UINT64 totalBytes = 0;
+	md3dDevice->GetCopyableFootprints(
+		&backBufferDesc,
+		0,
+		1,
+		0,
+		&footprint,
+		&numRows,
+		&rowSizeInBytes,
+		&totalBytes);
+
+	const CD3DX12_HEAP_PROPERTIES readbackHeapProperties(D3D12_HEAP_TYPE_READBACK);
+	const CD3DX12_RESOURCE_DESC readbackDesc = CD3DX12_RESOURCE_DESC::Buffer(totalBytes);
+	ThrowIfFailed(md3dDevice->CreateCommittedResource(
+		&readbackHeapProperties,
+		D3D12_HEAP_FLAG_NONE,
+		&readbackDesc,
+		D3D12_RESOURCE_STATE_COPY_DEST,
+		nullptr,
+		IID_PPV_ARGS(&mPendingFrameCapture.readbackBuffer)));
+
+	auto barrierToCopy = CD3DX12_RESOURCE_BARRIER::Transition(
+		backBuffer,
+		D3D12_RESOURCE_STATE_RENDER_TARGET,
+		D3D12_RESOURCE_STATE_COPY_SOURCE);
+	mCommandList->ResourceBarrier(1, &barrierToCopy);
+
+	D3D12_TEXTURE_COPY_LOCATION dst = {};
+	dst.pResource = mPendingFrameCapture.readbackBuffer.Get();
+	dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+	dst.PlacedFootprint = footprint;
+
+	D3D12_TEXTURE_COPY_LOCATION src = {};
+	src.pResource = backBuffer;
+	src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	src.SubresourceIndex = 0;
+
+	mCommandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+	auto barrierToRenderTarget = CD3DX12_RESOURCE_BARRIER::Transition(
+		backBuffer,
+		D3D12_RESOURCE_STATE_COPY_SOURCE,
+		D3D12_RESOURCE_STATE_RENDER_TARGET);
+	mCommandList->ResourceBarrier(1, &barrierToRenderTarget);
+
+	mPendingFrameCapture.footprint = footprint;
+	mPendingFrameCapture.width = static_cast<UINT>(backBufferDesc.Width);
+	mPendingFrameCapture.height = backBufferDesc.Height;
+	mPendingFrameCapture.valid = true;
+	return true;
+}
+
+bool ShapesApp::WritePendingFrameCaptureToPng()
+{
+	if (!mPendingFrameCapture.valid || mPendingFrameCapture.readbackBuffer == nullptr)
+	{
+		return false;
+	}
+
+	HRESULT coInitHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+	const bool shouldUninitializeCom = SUCCEEDED(coInitHr);
+	if (FAILED(coInitHr) && coInitHr != RPC_E_CHANGED_MODE)
+	{
+		mEditorStatus = "Frame capture failed: COM initialization failed";
+		mPendingFrameCapture.valid = false;
+		return false;
+	}
+
+	ComPtr<IWICImagingFactory> factory;
+	HRESULT hr = CoCreateInstance(
+		CLSID_WICImagingFactory2,
+		nullptr,
+		CLSCTX_INPROC_SERVER,
+		IID_PPV_ARGS(&factory));
+	if (FAILED(hr))
+	{
+		hr = CoCreateInstance(
+			CLSID_WICImagingFactory,
+			nullptr,
+			CLSCTX_INPROC_SERVER,
+			IID_PPV_ARGS(&factory));
+	}
+
+	bool saved = false;
+	if (SUCCEEDED(hr))
+	{
+		std::uint8_t* mappedData = nullptr;
+		const size_t compactRowPitch = static_cast<size_t>(mPendingFrameCapture.width) * 4;
+		std::vector<std::uint8_t> pixels(compactRowPitch * mPendingFrameCapture.height);
+
+		const D3D12_RANGE readRange =
+		{
+			static_cast<SIZE_T>(mPendingFrameCapture.footprint.Offset),
+			static_cast<SIZE_T>(mPendingFrameCapture.footprint.Offset + static_cast<UINT64>(mPendingFrameCapture.footprint.Footprint.RowPitch) * mPendingFrameCapture.height)
+		};
+		hr = mPendingFrameCapture.readbackBuffer->Map(0, &readRange, reinterpret_cast<void**>(&mappedData));
+		if (SUCCEEDED(hr))
+		{
+			const std::uint8_t* srcBase = mappedData + mPendingFrameCapture.footprint.Offset;
+			for (UINT y = 0; y < mPendingFrameCapture.height; ++y)
+			{
+				const std::uint8_t* srcRow = srcBase + static_cast<size_t>(y) * mPendingFrameCapture.footprint.Footprint.RowPitch;
+				std::uint8_t* dstRow = pixels.data() + static_cast<size_t>(y) * compactRowPitch;
+				std::copy(srcRow, srcRow + compactRowPitch, dstRow);
+			}
+			const D3D12_RANGE emptyWriteRange = { 0, 0 };
+			mPendingFrameCapture.readbackBuffer->Unmap(0, &emptyWriteRange);
+
+			ComPtr<IWICStream> stream;
+			ComPtr<IWICBitmapEncoder> encoder;
+			ComPtr<IWICBitmapFrameEncode> frame;
+			ComPtr<IPropertyBag2> propertyBag;
+			WICPixelFormatGUID pixelFormat = GUID_WICPixelFormat32bppRGBA;
+
+			hr = factory->CreateStream(&stream);
+			if (SUCCEEDED(hr))
+			{
+				hr = stream->InitializeFromFilename(mPendingFrameCapture.filename.c_str(), GENERIC_WRITE);
+			}
+			if (SUCCEEDED(hr))
+			{
+				hr = factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder);
+			}
+			if (SUCCEEDED(hr))
+			{
+				hr = encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache);
+			}
+			if (SUCCEEDED(hr))
+			{
+				hr = encoder->CreateNewFrame(&frame, &propertyBag);
+			}
+			if (SUCCEEDED(hr))
+			{
+				hr = frame->Initialize(propertyBag.Get());
+			}
+			if (SUCCEEDED(hr))
+			{
+				hr = frame->SetSize(mPendingFrameCapture.width, mPendingFrameCapture.height);
+			}
+			if (SUCCEEDED(hr))
+			{
+				hr = frame->SetPixelFormat(&pixelFormat);
+			}
+			if (SUCCEEDED(hr) && pixelFormat == GUID_WICPixelFormat32bppRGBA)
+			{
+				hr = frame->WritePixels(
+					mPendingFrameCapture.height,
+					static_cast<UINT>(compactRowPitch),
+					static_cast<UINT>(pixels.size()),
+					pixels.data());
+			}
+			if (SUCCEEDED(hr))
+			{
+				hr = frame->Commit();
+			}
+			if (SUCCEEDED(hr))
+			{
+				hr = encoder->Commit();
+			}
+
+			saved = SUCCEEDED(hr);
+		}
+	}
+
+	if (saved)
+	{
+		mEditorStatus = "Saved frame to " + std::filesystem::path(mPendingFrameCapture.filename).generic_string();
+	}
+	else
+	{
+		mEditorStatus = "Frame capture failed";
+	}
+
+	mPendingFrameCapture.valid = false;
+	mPendingFrameCapture.readbackBuffer.Reset();
+
+	if (shouldUninitializeCom)
+	{
+		CoUninitialize();
+	}
+
+	return saved;
+}
+
+std::wstring ShapesApp::MakeFrameCapturePath() const
+{
+	std::filesystem::path captureDir = std::filesystem::current_path() / L"Captures";
+	std::filesystem::create_directories(captureDir);
+
+	SYSTEMTIME localTime = {};
+	GetLocalTime(&localTime);
+
+	wchar_t filename[128] = {};
+	swprintf_s(
+		filename,
+		L"frame_%04hu%02hu%02hu_%02hu%02hu%02hu.png",
+		localTime.wYear,
+		localTime.wMonth,
+		localTime.wDay,
+		localTime.wHour,
+		localTime.wMinute,
+		localTime.wSecond);
+
+	return (captureDir / filename).wstring();
+}
+
+void ShapesApp::RegisterSceneObject(
+	const std::string& name,
+	const std::vector<RenderItem*>& renderItems,
+	const XMFLOAT3& position,
+	const XMFLOAT3& rotation,
+	const XMFLOAT3& scale)
+{
+	if (renderItems.empty())
+	{
+		return;
+	}
+
+	SceneObject sceneObject;
+	sceneObject.name = name;
+	sceneObject.renderItems = renderItems;
+	sceneObject.position = position;
+	sceneObject.rotation = rotation;
+	sceneObject.scale = scale;
+	mSceneObjects.push_back(sceneObject);
+	ApplySceneObjectTransform(mSceneObjects.back());
+}
+
+void ShapesApp::ApplySceneObjectTransform(SceneObject& sceneObject)
+{
+	const XMMATRIX objectWorld =
+		XMMatrixScaling(sceneObject.scale.x, sceneObject.scale.y, sceneObject.scale.z) *
+		XMMatrixRotationRollPitchYaw(sceneObject.rotation.x, sceneObject.rotation.y, sceneObject.rotation.z) *
+		XMMatrixTranslation(sceneObject.position.x, sceneObject.position.y, sceneObject.position.z);
+
+	XMStoreFloat4x4(&sceneObject.world, objectWorld);
+
+	for (RenderItem* renderItem : sceneObject.renderItems)
+	{
+		if (renderItem == nullptr)
+		{
+			continue;
+		}
+
+		const XMMATRIX localWorld = XMLoadFloat4x4(&renderItem->localWorld);
+		XMStoreFloat4x4(&renderItem->world, localWorld * objectWorld);
+		renderItem->numFramesDirty = static_cast<int>(mFrameResourcesCount);
+	}
+}
+
+ShapesApp::SceneObject* ShapesApp::GetSelectedSceneObject()
+{
+	if (mSelectedSceneObjectIndex < 0 || mSelectedSceneObjectIndex >= static_cast<int>(mSceneObjects.size()))
+	{
+		return nullptr;
+	}
+
+	return &mSceneObjects[mSelectedSceneObjectIndex];
+}
+
+void ShapesApp::ResetCameraToSceneView()
+{
+	const float x = mRadius * sinf(mPhi) * cosf(mTheta);
+	const float y = mRadius * cosf(mPhi);
+	const float z = mRadius * sinf(mPhi) * sinf(mTheta);
+
+	const XMVECTOR target = XMLoadFloat3(&mSceneBoundsCenter);
+	const XMVECTOR eyePos = target + XMVectorSet(x, y, z, 0.0f);
+	XMStoreFloat3(&mCameraPosition, eyePos);
+
+	const XMVECTOR forward = XMVector3Normalize(target - eyePos);
+	XMFLOAT3 forward3 = {};
+	XMStoreFloat3(&forward3, forward);
+
+	mCameraYaw = std::atan2(forward3.z, forward3.x);
+	mCameraPitch = std::asin(MathHelper::Clamp(forward3.y, -1.0f, 1.0f));
+}
+
+XMVECTOR ShapesApp::GetCameraForwardVector() const
+{
+	const float cosPitch = cosf(mCameraPitch);
+	const XMVECTOR forward = XMVectorSet(
+		cosPitch * cosf(mCameraYaw),
+		sinf(mCameraPitch),
+		cosPitch * sinf(mCameraYaw),
+		0.0f);
+	return XMVector3Normalize(forward);
+}
+
+float ShapesApp::GetCameraMoveUnitsPerPixel() const
+{
+	return std::max(0.01f, mSceneBoundsRadius * 0.0025f);
 }
 
 void ShapesApp::DrawSceneToShadowMap()
@@ -1761,9 +2531,11 @@ void ShapesApp::BuildRenderItems()
 		layer.clear();
 	}
 	mAllItem.clear();
+	mSceneObjects.clear();
+	mSelectedSceneObjectIndex = -1;
 
 	UINT nextObjCBIndex = 0;
-	auto addSubmeshItem = [&](MeshGeometry* geo, const std::string& drawKey, const std::string& materialKey, CXMMATRIX worldMatrix)
+	auto addSubmeshItem = [&](MeshGeometry* geo, const std::string& drawKey, const std::string& materialKey, CXMMATRIX worldMatrix) -> RenderItem*
 	{
 		const SubmeshGeometry* submesh = nullptr;
 		if (geo != nullptr)
@@ -1771,7 +2543,7 @@ void ShapesApp::BuildRenderItems()
 			const auto drawIt = geo->mDrawArgs.find(drawKey);
 			if (drawIt == geo->mDrawArgs.end())
 			{
-				return;
+				return nullptr;
 			}
 			submesh = &drawIt->second;
 		}
@@ -1780,13 +2552,14 @@ void ShapesApp::BuildRenderItems()
 			const auto drawIt = mDrawArgs.find(drawKey);
 			if (drawIt == mDrawArgs.end())
 			{
-				return;
+				return nullptr;
 			}
 			submesh = &drawIt->second;
 		}
 
 		auto renderItem = std::make_unique<RenderItem>();
 		XMStoreFloat4x4(&renderItem->world, worldMatrix);
+		renderItem->localWorld = MathHelper::Identity4x4();
 		renderItem->geo = geo;
 		renderItem->mObjCBIndex = nextObjCBIndex++;
 		renderItem->mPrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
@@ -1796,12 +2569,14 @@ void ShapesApp::BuildRenderItems()
 		auto materialIt = materials.find(materialKey);
 		renderItem->mat = materialIt != materials.end() ? materialIt->second.get() : materials["pbrFloor"].get();
 		renderItem->layer = RenderLayer::Opaque;
+		RenderItem* result = renderItem.get();
 		mAllItem.push_back(std::move(renderItem));
+		return result;
 	};
 
-	auto addTestItem = [&](const std::string& drawKey, const std::string& materialKey, CXMMATRIX worldMatrix)
+	auto addTestItem = [&](const std::string& drawKey, const std::string& materialKey, CXMMATRIX worldMatrix) -> RenderItem*
 	{
-		addSubmeshItem(nullptr, drawKey, materialKey, worldMatrix);
+		return addSubmeshItem(nullptr, drawKey, materialKey, worldMatrix);
 	};
 
 	auto addSkyItem = [&]()
@@ -1830,15 +2605,26 @@ void ShapesApp::BuildRenderItems()
 		}
 
 		MeshGeometry* geometry = geometryIt->second.get();
+		std::vector<RenderItem*> objectRenderItems;
 		for (const auto& submeshKey : geometry->mSubmeshOrder)
 		{
 			const auto materialIt = geometry->mSubmeshMaterials.find(submeshKey);
 			const std::string materialKey = materialIt != geometry->mSubmeshMaterials.end()
 				? materialIt->second
 				: "pbrFloor";
-			addSubmeshItem(geometry, submeshKey, materialKey, XMMatrixIdentity());
-			addedImportedModel = true;
+			if (RenderItem* renderItem = addSubmeshItem(geometry, submeshKey, materialKey, XMMatrixIdentity()))
+			{
+				objectRenderItems.push_back(renderItem);
+				addedImportedModel = true;
+			}
 		}
+
+		RegisterSceneObject(
+			geometryName,
+			objectRenderItems,
+			XMFLOAT3(0.0f, 0.0f, 0.0f),
+			XMFLOAT3(0.0f, 0.0f, 0.0f),
+			XMFLOAT3(1.0f, 1.0f, 1.0f));
 
 		if (geometry->bounds.valid)
 		{
@@ -1872,8 +2658,24 @@ void ShapesApp::BuildRenderItems()
 	}
 	else
 	{
-		addTestItem("grid", "pbrFloor", XMMatrixIdentity());
-		addTestItem("sphere", "pbrMetalSphere", XMMatrixScaling(2.0f, 2.0f, 2.0f) * XMMatrixTranslation(0.0f, 1.0f, 0.0f));
+		if (RenderItem* gridItem = addTestItem("grid", "pbrFloor", XMMatrixIdentity()))
+		{
+			RegisterSceneObject(
+				"grid",
+				{ gridItem },
+				XMFLOAT3(0.0f, 0.0f, 0.0f),
+				XMFLOAT3(0.0f, 0.0f, 0.0f),
+				XMFLOAT3(1.0f, 1.0f, 1.0f));
+		}
+		if (RenderItem* sphereItem = addTestItem("sphere", "pbrMetalSphere", XMMatrixIdentity()))
+		{
+			RegisterSceneObject(
+				"sphere",
+				{ sphereItem },
+				XMFLOAT3(0.0f, 1.0f, 0.0f),
+				XMFLOAT3(0.0f, 0.0f, 0.0f),
+				XMFLOAT3(2.0f, 2.0f, 2.0f));
+		}
 
 		mSceneBoundsCenter = XMFLOAT3(0.0f, 1.0f, 0.0f);
 		mSceneBoundsRadius = 18.0f;
@@ -1884,6 +2686,12 @@ void ShapesApp::BuildRenderItems()
 		mRitemLayer[(int)renderItem->layer].push_back(renderItem.get());
 	}
 
+	if (!mSceneObjects.empty())
+	{
+		mSelectedSceneObjectIndex = 0;
+	}
+
+	ResetCameraToSceneView();
 	UpdateProjectionMatrix();
 }
 
@@ -1905,6 +2713,8 @@ void ShapesApp::BuildFrameResource()
 
 void ShapesApp::Update(GameTimer& gt)
 {
+	ProcessEditorCommands();
+
 	mCurrentFrameResourcesIndex = (mCurrentFrameResourcesIndex + 1) % mFrameResourcesCount;
 	mCurrentFrameResources = mFrameResourcesArray[mCurrentFrameResourcesIndex].get();
 
@@ -1947,17 +2757,14 @@ void ShapesApp::UpdateObjCBs()
 
 void ShapesApp::UpdatePassCBs(const GameTimer& gt)
 {
-	const float x = mRadius * sinf(mPhi) * cosf(mTheta);
-	const float y = mRadius * cosf(mPhi);
-	const float z = mRadius * sinf(mPhi) * sinf(mTheta);
-
-	const XMVECTOR target = XMLoadFloat3(&mSceneBoundsCenter);
-	const XMVECTOR eyePos = target + XMVectorSet(x, y, z, 0.0f);
+	const XMVECTOR eyePos = XMLoadFloat3(&mCameraPosition);
+	const XMVECTOR forward = GetCameraForwardVector();
 	const XMVECTOR up = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
-	const XMMATRIX view = XMMatrixLookAtLH(eyePos, target, up);
+	const XMMATRIX view = XMMatrixLookToLH(eyePos, forward, up);
 	const XMMATRIX proj = XMLoadFloat4x4(&mProj);
 	const XMMATRIX viewProj = view * proj;
 
+	XMStoreFloat4x4(&mView, view);
 	XMStoreFloat4x4(&passConstants.ViewProj, XMMatrixTranspose(viewProj));
 	XMStoreFloat3(&passConstants.cameraPosW, eyePos);
 	passConstants.totalTime = gt.TotalTime();
