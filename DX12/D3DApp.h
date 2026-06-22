@@ -33,9 +33,9 @@ public:
 	bool InitDirect3D(HWND mhMainWnd);
 	bool Init(HINSTANCE hInstance, int nShowCmd, std::wstring customCaption);
 	virtual LRESULT MsgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
-	void OnMouseDown(WPARAM btnState, int x, int y);
-	void OnMouseUp(WPARAM btnState, int x, int y);
-	void OnMouseMove(WPARAM btnState, int x, int y);
+	virtual void OnMouseDown(WPARAM btnState, int x, int y);
+	virtual void OnMouseUp(WPARAM btnState, int x, int y);
+	virtual void OnMouseMove(WPARAM btnState, int x, int y);
 	virtual void Draw() = 0;
 
 	static D3DApp* mApp;
