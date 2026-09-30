@@ -183,6 +183,8 @@ $env:DX12_ASSET_ROOT = (Resolve-Path .\optional-assets).Path
 
 也支持 runtime 目录下 `Assets/` 的同一结构，以及 `Models/Sponza/sponza.obj`。没有自动下载步骤；请保留模型/HDR/纹理的许可和来源。构建输出外放时，将 `Shaders/`、`Textures/`、`Models/` 与 executable 一起保留。
 
+HDR / 图像路径按 Windows Unicode → UTF-8 传给 stb_image；OBJ / MTL 导入仍使用现有 narrow-path 接口，非 ASCII 模型目录还没有完整验证。
+
 ## 操作方式
 
 - 鼠标右键拖动：相机旋转

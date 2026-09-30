@@ -6,10 +6,12 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <filesystem>
 
 #include "DDSTextureLoader.h"
 
 #define STB_IMAGE_IMPLEMENTATION
+#define STBI_WINDOWS_UTF8
 #include "third_party/stb_image.h"
 
 namespace
@@ -283,7 +285,8 @@ ComPtr<ID3D12Resource> CreateTextureFromFile(
 
 	if (lowered.size() >= 4 && lowered.substr(lowered.size() - 4) == L".hdr")
 	{
-		const std::string narrowPath(filename.begin(), filename.end());
+		const auto utf8Path = std::filesystem::path(filename).u8string();
+		const std::string narrowPath(reinterpret_cast<const char*>(utf8Path.data()), utf8Path.size());
 		int width = 0;
 		int height = 0;
 		int channels = 0;
@@ -360,7 +363,8 @@ ComPtr<ID3D12Resource> CreateTextureFromFile(
 		return texture;
 	}
 
-	const std::string narrowPath(filename.begin(), filename.end());
+	const auto utf8Path = std::filesystem::path(filename).u8string();
+	const std::string narrowPath(reinterpret_cast<const char*>(utf8Path.data()), utf8Path.size());
 	int width = 0;
 	int height = 0;
 	int channels = 0;
