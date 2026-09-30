@@ -28,7 +28,7 @@ protected :
 	D3DApp(HINSTANCE hInstance);
     ~D3DApp();
 public:
-	int Run();
+	int Run(unsigned int maxFrames = 0);
 	bool InitWindow(HINSTANCE hInstance, int nShowCmd);
 	bool InitDirect3D(HWND mhMainWnd);
 	bool Init(HINSTANCE hInstance, int nShowCmd, std::wstring customCaption);

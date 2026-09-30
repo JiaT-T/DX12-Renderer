@@ -6,6 +6,8 @@
 *.lo
 *.o
 *.obj
+# Wavefront model source files are not compiler object files.
+!DX12/Models/**/*.obj
 
 # Precompiled Headers
 *.gch
@@ -77,3 +79,6 @@ obj/
 out/
 build*/
 DX12/runtime_capture*.png
+
+# Dear ImGui user layout
+imgui.ini

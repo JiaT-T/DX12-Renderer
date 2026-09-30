@@ -218,7 +218,7 @@ protected:
 	std::vector<SceneObject> mSceneObjects;
 	int mSelectedSceneObjectIndex = -1;
 	std::vector<std::string> mSceneModelGeometryNames;
-	std::string mEnvironmentTextureName = "suburbanGardenHdrTex";
+	std::string mEnvironmentTextureName = "environmentTex";
 	UINT mNextSrvHeapIndex = 0;
 	UINT mShadowMapSrvHeapIndex = std::numeric_limits<UINT>::max();
 	UINT mBrdfLutSrvHeapIndex = std::numeric_limits<UINT>::max();
