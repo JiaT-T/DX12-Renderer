@@ -411,8 +411,9 @@ bool D3DApp::InitWindow(HINSTANCE hInstance, int nShowCmd)
 }
 
 //主循环
-int D3DApp::Run()
+int D3DApp::Run(unsigned int maxFrames)
 {
+    unsigned int renderedFrames = 0;
 	MSG msg = { 0 };																	  //定义消息结构体
 	//每次循环开始前都要先重置计时器
 	gameTimer.Reset();
@@ -432,6 +433,7 @@ int D3DApp::Run()
 				CalculateFrameState();
 				Update(gameTimer);
 				Draw();
+                if (maxFrames > 0 && ++renderedFrames >= maxFrames) return 0;
 			}
 			else
 			{

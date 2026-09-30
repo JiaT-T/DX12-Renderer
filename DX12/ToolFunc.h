@@ -54,6 +54,11 @@ ComPtr<ID3D12Resource> CreateDefaultBuffer(
 	const void* initData,
 	ComPtr<ID3D12Resource>& uploadBuffer);
 
+ComPtr<ID3D12Resource> CreateProceduralEnvironmentTexture(
+    ID3D12Device* device,
+    ID3D12GraphicsCommandList* cmdlist,
+    ComPtr<ID3D12Resource>& uploadBuffer);
+
 ComPtr<ID3D12Resource> CreateTextureFromFile(
 	ID3D12Device* device,
 	ID3D12GraphicsCommandList* cmdlist,

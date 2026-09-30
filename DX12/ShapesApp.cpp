@@ -9,6 +9,7 @@
 #include <cmath>
 #include <commdlg.h>
 #include <filesystem>
+#include <cstdlib>
 #include <map>
 #include <vector>
 #include <wincodec.h>
@@ -29,6 +30,26 @@ using namespace Microsoft::WRL;
 
 namespace
 {
+    std::filesystem::path FindOptionalAsset(const std::filesystem::path& relative)
+    {
+        std::vector<std::filesystem::path> roots;
+        wchar_t* environment = nullptr;
+        size_t length = 0;
+        if (_wdupenv_s(&environment, &length, L"DX12_ASSET_ROOT") == 0 && environment != nullptr)
+        {
+            if (*environment) roots.emplace_back(environment);
+            free(environment);
+        }
+        roots.emplace_back("Assets");
+        roots.emplace_back(".");
+        for (const auto& root : roots)
+        {
+            const auto candidate = root / relative;
+            if (std::filesystem::is_regular_file(candidate)) return candidate;
+        }
+        return {};
+    }
+
 	XMFLOAT4 ComputeFallbackTangent(const XMFLOAT3& normal)
 	{
 		const XMVECTOR n = XMVector3Normalize(XMLoadFloat3(&normal));
@@ -2126,11 +2147,30 @@ void ShapesApp::LoadTextures()
 	LoadTextureAsset("tileTex", L"Textures/tile.dds", true);
 	LoadTextureAsset("tileNormalTex", L"Textures/tile_nmap.dds", false);
 	LoadTextureAsset("treeArray2Tex", L"Textures/treearray.dds", true);
-	LoadTextureAsset("suburbanGardenHdrTex", L"D:/Computer Graphics/PathTracer/PathTracer-CPP/images/HDR/suburban_garden_2k.hdr", false);
-	LoadTextureAsset("metal1BaseColorTex", L"D:/Computer Graphics/PathTracer/PathTracer-CPP/images/Metal1/Metal049A_2K-JPG_Color.jpg", true);
-	LoadTextureAsset("metal1NormalTex", L"D:/Computer Graphics/PathTracer/PathTracer-CPP/images/Metal1/Metal049A_2K-JPG_NormalDX.jpg", false);
-	LoadTextureAsset("metal1RoughnessTex", L"D:/Computer Graphics/PathTracer/PathTracer-CPP/images/Metal1/Metal049A_2K-JPG_Roughness.jpg", false);
-	LoadTextureAsset("metal1MetallicTex", L"D:/Computer Graphics/PathTracer/PathTracer-CPP/images/Metal1/Metal049A_2K-JPG_Metalness.jpg", false);
+    const auto environment = FindOptionalAsset(L"images/HDR/suburban_garden_2k.hdr");
+    if (!environment.empty())
+        LoadTextureAsset(mEnvironmentTextureName, environment.wstring(), false);
+    else
+    {
+        auto texture = std::make_unique<Texture>();
+        texture->name = mEnvironmentTextureName;
+        texture->resource = CreateProceduralEnvironmentTexture(md3dDevice.Get(), mCommandList.Get(), texture->uploadHeap);
+        texture->srvFormat = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        texture->srvHeapIndex = static_cast<int>(mNextSrvHeapIndex++);
+        textures[mEnvironmentTextureName] = std::move(texture);
+        OutputDebugStringA("Optional HDR not found; using the procedural environment.\n");
+    }
+    auto loadOptional = [this](const char* name, const wchar_t* relative, bool srgb)
+    {
+        const auto path = FindOptionalAsset(relative);
+        if (!path.empty()) LoadTextureAsset(name, path.wstring(), srgb);
+    };
+    loadOptional("metal1BaseColorTex", L"images/Metal1/Metal049A_2K-JPG_Color.jpg", true);
+    loadOptional("metal1NormalTex", L"images/Metal1/Metal049A_2K-JPG_NormalDX.jpg", false);
+    if (!GetTextureAsset("metal1NormalTex"))
+        loadOptional("metal1NormalTex", L"images/Metal1/Metal049A_2K-JPG_NormalGL.jpg", false);
+    loadOptional("metal1RoughnessTex", L"images/Metal1/Metal049A_2K-JPG_Roughness.jpg", false);
+    loadOptional("metal1MetallicTex", L"images/Metal1/Metal049A_2K-JPG_Metalness.jpg", false);
 }
 
 void ShapesApp::BuildMaterial()
@@ -2176,18 +2216,24 @@ void ShapesApp::BuildMaterial()
 	addMaterial("mirror", "white1x1Tex", "defaultNormalTex", { 1.0f, 1.0f, 1.0f, 0.25f }, { 0.04f, 0.04f, 0.04f }, 0.05f, 1.0f);
 	addMaterial("shadow", "white1x1Tex", "defaultNormalTex", { 0.0f, 0.0f, 0.0f, 0.25f }, { 0.0f, 0.0f, 0.0f }, 1.0f, 0.0f);
 	addMaterial("treeBillboard", "treeArray2Tex", "defaultNormalTex", { 1.0f, 1.0f, 1.0f, 1.0f }, { 0.04f, 0.04f, 0.04f }, 0.85f, 0.0f, 0.0f, 0.1f);
+    const auto optionalTexture = [this](const char* name, const char* fallback)
+    {
+        return GetTextureAsset(name) ? name : fallback;
+    };
+    const auto* normalTexture = GetTextureAsset("metal1NormalTex");
+    const float normalFlipY = normalTexture && ShouldFlipNormalY(std::filesystem::path(normalTexture->filename).filename().string()) ? 1.0f : 0.0f;
 	addMaterial(
 		"pbrMetalSphere",
-		"metal1BaseColorTex",
-		"metal1NormalTex",
-		{ 1.0f, 1.0f, 1.0f, 1.0f },
+        optionalTexture("metal1BaseColorTex", "white1x1Tex"),
+        optionalTexture("metal1NormalTex", "defaultNormalTex"),
+        GetTextureAsset("metal1BaseColorTex") ? XMFLOAT4(1, 1, 1, 1) : XMFLOAT4(0.95f, 0.64f, 0.54f, 1),
 		{ 0.04f, 0.04f, 0.04f },
+        GetTextureAsset("metal1RoughnessTex") ? 1.0f : 0.35f,
 		1.0f,
-		1.0f,
-		0.0f,
+        normalFlipY,
 		0.1f,
-		"metal1RoughnessTex",
-		"metal1MetallicTex",
+        optionalTexture("metal1RoughnessTex", "white1x1Tex"),
+        optionalTexture("metal1MetallicTex", "white1x1Tex"),
 		1.0f);
 	addMaterial("pbrFloor", "tileTex", "tileNormalTex", { 0.82f, 0.84f, 0.82f, 1.0f }, { 0.04f, 0.04f, 0.04f }, 0.95f, 0.0f);
 }
@@ -2507,7 +2553,8 @@ void ShapesApp::BuildStaticSceneModels()
 
 	const std::wstring sponzaCandidates[] =
 	{
-		L"D:/Computer Graphics/PathTracer/PathTracer-CPP/Model/sponza/sponza.obj",
+		FindOptionalAsset(L"Model/sponza/sponza.obj").wstring(),
+        FindOptionalAsset(L"Model/sponza.obj").wstring(),
 		L"Models/Sponza/sponza.obj",
 		L"Models/Sponza/Sponza.obj",
 		L"Models/sponza/sponza.obj"
@@ -2515,6 +2562,7 @@ void ShapesApp::BuildStaticSceneModels()
 
 	for (const auto& candidate : sponzaCandidates)
 	{
+        if (candidate.empty() || !std::filesystem::is_regular_file(candidate)) continue;
 		if (BuildObjModel(candidate, "sponzaGeo", "sponza"))
 		{
 			return;

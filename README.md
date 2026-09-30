@@ -4,6 +4,14 @@
 
 ![Sponza preview](./README_Assets/sponza_preview.png)
 
+上图是作者使用外部 Sponza / HDR 资源记录的效果。干净 clone 默认运行程序生成的 PBR 校验场景与小型环境贴图；复现该截图需要自行准备有许可的外部模型与 HDR。
+
+## Highlights
+
+- DirectX 12 forward pipeline：描述符堆、多帧常量/资源同步、独立 shadow pass 与 `3×3 PCF`。
+- GGX metallic-roughness PBR：HDR 经纬环境输入、irradiance / prefilter / BRDF LUT 的 split-sum IBL。
+- OBJ / MTL 材质与切线空间法线、alpha mask；ImGui / ImGuizmo 场景检查和 transform 编辑。
+
 ## 当前特性
 
 - 基于 `DirectX 12 + Win32` 的基础渲染框架
@@ -43,7 +51,7 @@
 
 ## 当前场景
 
-当前运行场景用于验证 PBR、IBL、shadow map 与复杂 OBJ 场景资产的组合效果，包含：
+作者的 Sponza 展示场景用于验证 PBR、IBL、shadow map 与复杂 OBJ 场景资产的组合效果，包含：
 
 - Sponza 静态场景模型
 - MTL 材质拆分后的多个子网格
@@ -58,8 +66,10 @@
 - [`DX12/Shaders/PrefilterEnvMap.hlsl`](./DX12/Shaders/PrefilterEnvMap.hlsl)
 - [`DX12/Shaders/ShadowMap.hlsl`](./DX12/Shaders/ShadowMap.hlsl)
 - [`DX12/Shaders/Sky.hlsl`](./DX12/Shaders/Sky.hlsl)
-- `D:/Computer Graphics/PathTracer/PathTracer-CPP/Model/sponza`
-- `D:/Computer Graphics/PathTracer/PathTracer-CPP/images/HDR/suburban_garden_2k.hdr`
+- 可选 `Model/sponza/sponza.obj` 与其 MTL / textures
+- 可选 `images/HDR/suburban_garden_2k.hdr`
+
+这些外部测试资源通过 `DX12_ASSET_ROOT` 指定，不依赖另一份本地工程，也没有在本次清理中复制进仓库。
 
 ## 渲染流程
 
@@ -106,6 +116,27 @@
 
 ## 构建方式
 
+### CMake
+
+要求 Windows、DirectX 12 feature level 12.0 的 GPU/驱动、Visual Studio 2022 Desktop development with C++ workload（v143）、Windows SDK，以及 CMake 3.21+。`tinyobjloader`、`stb_image`、Dear ImGui 1.90.9 与 ImGuizmo 已 vendored，不需要外部 DirectX-Headers 目录。
+
+在仓库根目录：
+
+```powershell
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --config Release
+.\build\Release\DX12Renderer.exe
+# 隐藏窗口，完成着色器/IBL初始化与 10 帧渲染后退出：
+$process = Start-Process .\build\Release\DX12Renderer.exe -ArgumentList '--smoke' -Wait -PassThru -WindowStyle Hidden
+$process.ExitCode
+```
+
+CMake 将 `Shaders/`、`Textures/`、`Models/` 复制到 executable 旁。程序也会从 executable / 当前目录的祖先定位仓库 `DX12/`，因此 Visual Studio 工程启动不需要本机绝对路径。MSVC 的 C++23 配置使用 `/std:c++latest`，兼容这里验证的 VS2022 工具集。部分旧 Win32 源码与 header 使用 CP936 注释，构建显式保留该输入字符集。
+
+`--smoke` 退出码 0 表示初始化与有限帧运行完成；它不替代截图画质、性能或完整交互验证。Debug 配置需要 Windows Graphics Tools 的 D3D12 debug layer。
+
+### Visual Studio 工程
+
 推荐环境：
 
 - Visual Studio 2022
@@ -129,11 +160,36 @@
 - `stb_image`
 - `DDSTextureLoader`
 
+## 可选外部资源
+
+默认运行所需的 sample DDS / skull 已在仓库中；缺少外部 Sponza、HDR 或 Metal1 贴图时，使用 procedural geometry、factor-based PBR 与代码生成的 linear lat-long 环境，仍执行 IBL / shadow / PBR 主链路。默认效果与 Sponza 截图不同。
+
+外部资源目录示例：
+
+```text
+optional-assets/
+  Model/sponza/sponza.obj        # MTL 和贴图相对模型目录
+  images/HDR/suburban_garden_2k.hdr
+  images/Metal1/Metal049A_2K-JPG_Color.jpg
+  images/Metal1/Metal049A_2K-JPG_NormalDX.jpg  # 或 NormalGL，自动翻转 Y
+  images/Metal1/Metal049A_2K-JPG_Roughness.jpg
+  images/Metal1/Metal049A_2K-JPG_Metalness.jpg
+```
+
+```powershell
+$env:DX12_ASSET_ROOT = (Resolve-Path .\optional-assets).Path
+.\build\Release\DX12Renderer.exe
+```
+
+也支持 runtime 目录下 `Assets/` 的同一结构，以及 `Models/Sponza/sponza.obj`。没有自动下载步骤；请保留模型/HDR/纹理的许可和来源。构建输出外放时，将 `Shaders/`、`Textures/`、`Models/` 与 executable 一起保留。
+
 ## 操作方式
 
-- 鼠标左键拖动：旋转相机
-- 鼠标右键拖动：调整观察距离
+- 鼠标右键拖动：相机旋转
+- 鼠标左键拖动：前进 / 后退
+- 鼠标中键拖动：上下移动
 - 方向键：调整主光源方向
+- ImGui 面板：导入 OBJ、选择物体、编辑 transform / ImGuizmo gizmo、截图
 
 ## 当前限制
 
@@ -146,3 +202,10 @@
 ## 项目定位
 
 该项目用于验证实时渲染中的核心基础模块如何在 DirectX 12 中完成工程化落地，包括资源管理、材质系统、基于 IBL 的环境光照、阴影映射与着色器协作。当前版本已经能够较完整地展示一条可运行的实时 PBR 主链路，并为后续扩展更复杂的实时渲染特性提供基础。
+
+## 引用与许可
+
+- [tinyobjloader](https://github.com/tinyobjloader/tinyobjloader) / [stb](https://github.com/nothings/stb)：vendored header 保留原始许可。
+- [Dear ImGui](https://github.com/ocornut/imgui/tree/v1.90.9) / [ImGuizmo](https://github.com/CedricGuillemet/ImGuizmo)：MIT；Dear ImGui notice 已按 vendored 版本恢复。
+- Microsoft D3D12 / DDS / MiniEngine-derived utilities 与 Frank Luna `MathHelper` 的文件内来源说明保持不变。
+- [ASSETS.md](./ASSETS.md) 记录 sample DDS、模型与其他第三方内容的许可证据和待确认项。仓库 MIT LICENSE 不会自动覆盖这些资产。

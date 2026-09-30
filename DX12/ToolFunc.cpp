@@ -221,6 +221,40 @@ ComPtr<ID3D12Resource> CreateDefaultBuffer(
 	return defaultBuffer;
 }
 
+ComPtr<ID3D12Resource> CreateProceduralEnvironmentTexture(
+    ID3D12Device* device,
+    ID3D12GraphicsCommandList* cmdlist,
+    ComPtr<ID3D12Resource>& uploadBuffer)
+{
+    // Small linear lat-long sky, generated in memory; no third-party HDR needed.
+    constexpr UINT width = 4;
+    constexpr UINT height = 2;
+    const float pixels[width * height * 4] = {
+        0.35f, 0.50f, 0.75f, 1.0f, 0.35f, 0.50f, 0.75f, 1.0f,
+        0.35f, 0.50f, 0.75f, 1.0f, 0.35f, 0.50f, 0.75f, 1.0f,
+        0.08f, 0.07f, 0.06f, 1.0f, 0.08f, 0.07f, 0.06f, 1.0f,
+        0.08f, 0.07f, 0.06f, 1.0f, 0.08f, 0.07f, 0.06f, 1.0f
+    };
+    auto description = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R32G32B32A32_FLOAT, width, height, 1, 1);
+    auto defaultHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+    ComPtr<ID3D12Resource> texture;
+    ThrowIfFailed(device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &description,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(texture.GetAddressOf())));
+    auto uploadHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
+    auto uploadDescription = CD3DX12_RESOURCE_DESC::Buffer(GetRequiredIntermediateSize(texture.Get(), 0, 1));
+    ThrowIfFailed(device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &uploadDescription,
+        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(uploadBuffer.GetAddressOf())));
+    D3D12_SUBRESOURCE_DATA data = {};
+    data.pData = pixels;
+    data.RowPitch = width * 4 * sizeof(float);
+    data.SlicePitch = data.RowPitch * height;
+    UpdateSubresources<1>(cmdlist, texture.Get(), uploadBuffer.Get(), 0, 0, 1, &data);
+    auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(texture.Get(),
+        D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    cmdlist->ResourceBarrier(1, &barrier);
+    return texture;
+}
+
 ComPtr<ID3D12Resource> CreateTextureFromFile(
 	ID3D12Device* device,
 	ID3D12GraphicsCommandList* cmdlist,
